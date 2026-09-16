@@ -1,0 +1,6 @@
+{
+  "name": "Light Up Prayer House",
+  "description": "Professional, mobile-first website for Light Up Prayer House Family Outreach — a global Christian NGO focused on prayer, revival, and community transformation.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,9 @@
+@import "tailwindcss";
+
+/* Hide Netlify feedback drawer or badges if injected in preview builds */
+#netlify-drawer,
+.netlify-feedback-button,
+[id^="netlify-drawer"],
+iframe[src*="netlify"] {
+  display: none !important;
+}

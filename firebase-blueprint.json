@@ -1,0 +1,239 @@
+{
+  "entities": {
+    "User": {
+      "title": "User",
+      "description": "User profile information and roles",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "email": { "type": "string", "format": "email" },
+        "displayName": { "type": "string" },
+        "role": { "type": "string", "enum": ["super_admin", "admin_assistant", "member"] },
+        "permissions": { "type": "array", "items": { "type": "string" } },
+        "country": { "type": "string" },
+        "timezone": { "type": "string" },
+        "whatsappGroup": { "type": "string" },
+        "attendanceCount": { "type": "number" },
+        "joinedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "email", "role"]
+    },
+    "Theme": {
+      "title": "Weekly Theme",
+      "description": "Details about the current and past weekly prayer themes",
+      "type": "object",
+      "properties": {
+        "title": { "type": "string" },
+        "scripture": { "type": "string" },
+        "flyerUrl": { "type": "string" },
+        "startDate": { "type": "string", "format": "date" },
+        "endDate": { "type": "string", "format": "date" },
+        "minister": { "type": "string" },
+        "prayerPoints": { "type": "array", "items": { "type": "string" } },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["title", "scripture", "startDate", "endDate"]
+    },
+    "Testimony": {
+      "title": "Testimony",
+      "description": "User-submitted testimonies for moderation and display",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "name": { "type": "string" },
+        "country": { "type": "string" },
+        "category": { "type": "string", "enum": ["Healing", "Deliverance", "Provision", "Restoration", "Other"] },
+        "text": { "type": "string" },
+        "imageUrl": { "type": "string" },
+        "videoUrl": { "type": "string" },
+        "status": { "type": "string", "enum": ["pending", "approved", "declined"] },
+        "isAnonymous": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["category", "text", "status", "createdAt"]
+    },
+    "PrayerRequest": {
+      "title": "Prayer Request",
+      "description": "Submissions for prayer by members",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "name": { "type": "string" },
+        "text": { "type": "string" },
+        "status": { "type": "string", "enum": ["pending", "answered"] },
+        "isAnonymous": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["text", "status", "createdAt"]
+    },
+    "OutreachProject": {
+      "title": "Outreach Project",
+      "description": "Ongoing and completed NGO outreach initiatives",
+      "type": "object",
+      "properties": {
+        "title": { "type": "string" },
+        "description": { "type": "string" },
+        "imageUrl": { "type": "string" },
+        "status": { "type": "string", "enum": ["active", "completed"] },
+        "goalAmount": { "type": "number" },
+        "currentAmount": { "type": "number" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["title", "description", "status"]
+    },
+    "Attendance": {
+      "title": "Attendance Record",
+      "description": "Daily attendance check-ins for prayer sessions",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "date": { "type": "string", "format": "date" },
+        "timestamp": { "type": "string", "format": "date-time" }
+      },
+      "required": ["userId", "date", "timestamp"]
+    },
+    "Sermon": {
+      "title": "Sermon/Teaching",
+      "description": "Media resources for sermons and teachings",
+      "type": "object",
+      "properties": {
+        "title": { "type": "string" },
+        "youtubeId": { "type": "string" },
+        "audioUrl": { "type": "string" },
+        "date": { "type": "string", "format": "date" },
+        "minister": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["title", "date", "minister"]
+    },
+    "Program": {
+      "title": "Upcoming Program",
+      "description": "Special revival and outreach programs",
+      "type": "object",
+      "properties": {
+        "title": { "type": "string" },
+        "series": { "type": "string" },
+        "theme": { "type": "string" },
+        "date": { "type": "string" },
+        "time": { "type": "string" },
+        "location": { "type": "string" },
+        "imageUrl": { "type": "string" },
+        "description": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["title", "date", "theme", "imageUrl"]
+    },
+    "SiteSettings": {
+      "title": "Site Settings",
+      "description": "Global branding and site configuration",
+      "type": "object",
+      "properties": {
+        "logoUrl": { "type": "string" },
+        "siteName": { "type": "string" },
+        "tagline": { "type": "string" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["logoUrl"]
+    },
+    "GuestAttendance": {
+      "title": "Guest Attendance Record",
+      "description": "Unified visitor attendance profile with daily and yearly cumulative prayer time tracking",
+      "type": "object",
+      "properties": {
+        "guestId": { "type": "string" },
+        "guestName": { "type": "string" },
+        "guestPhone": { "type": "string" },
+        "lastDateStr": { "type": "string" },
+        "todaySeconds": { "type": "number" },
+        "todayMinutes": { "type": "number" },
+        "yearlySeconds": { "type": "number" },
+        "yearlyMinutes": { "type": "number" },
+        "totalSeconds": { "type": "number" },
+        "totalMinutes": { "type": "number" },
+        "status": { "type": "string", "enum": ["active", "completed"] },
+        "deviceInfo": { "type": "string" },
+        "meetingType": { "type": "string" }
+      },
+      "required": ["guestId"]
+    },
+    "Book": {
+      "title": "Book / Publication",
+      "description": "Spiritual books, e-books, and publications authored by Pastor Osaro Aghedo and ministry ministers",
+      "type": "object",
+      "properties": {
+        "title": { "type": "string" },
+        "subtitle": { "type": "string" },
+        "author": { "type": "string" },
+        "description": { "type": "string" },
+        "coverImageUrl": { "type": "string" },
+        "category": { "type": "string" },
+        "format": { "type": "string" },
+        "pages": { "type": "string" },
+        "publishedYear": { "type": "string" },
+        "isbn": { "type": "string" },
+        "downloadUrl": { "type": "string" },
+        "previewUrl": { "type": "string" },
+        "purchaseUrl": { "type": "string" },
+        "isFree": { "type": "boolean" },
+        "price": { "type": "string" },
+        "isFeatured": { "type": "boolean" },
+        "isPublished": { "type": "boolean" },
+        "order": { "type": "number" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["title", "author", "description"]
+    }
+  },
+  "firestore": {
+    "users": {
+      "schema": "User",
+      "description": "User profiles and roles"
+    },
+    "books": {
+      "schema": "Book",
+      "description": "Spiritual books and publications library"
+    },
+    "themes": {
+      "schema": "Theme",
+      "description": "Weekly prayer themes"
+    },
+    "testimonies": {
+      "schema": "Testimony",
+      "description": "Member testimonies"
+    },
+    "prayer_requests": {
+      "schema": "PrayerRequest",
+      "description": "Member prayer requests"
+    },
+    "outreach_projects": {
+      "schema": "OutreachProject",
+      "description": "NGO projects"
+    },
+    "attendance": {
+      "schema": "Attendance",
+      "description": "Daily attendance logs"
+    },
+    "sermons": {
+      "schema": "Sermon",
+      "description": "Teaching and sermon media archive"
+    },
+    "programs": {
+      "schema": "Program",
+      "description": "Upcoming special events and programs"
+    },
+    "settings": {
+      "schema": "SiteSettings",
+      "description": "Global branding and site configuration"
+    },
+    "guest_attendance": {
+      "schema": "GuestAttendance",
+      "description": "Attendance logs for non-registered users (guests)"
+    },
+    "live_meetings": {
+      "description": "Real-time meeting status and participant count"
+    },
+    "admin_passwords": {
+      "description": "Custom per-administrator password credentials"
+    }
+  }
+}
