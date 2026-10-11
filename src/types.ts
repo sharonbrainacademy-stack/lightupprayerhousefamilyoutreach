@@ -152,7 +152,7 @@ export interface ZoomParticipantLog {
   isMember?: boolean;
   memberUid?: string;
   whatsappCommunity?: string;
-  status?: 'synced' | 'guest' | 'manual';
+  status?: 'synced' | 'guest' | 'manual' | 'reversed_absent';
   createdAt?: any;
 }
 

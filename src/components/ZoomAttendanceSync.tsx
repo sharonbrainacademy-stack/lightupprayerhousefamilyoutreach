@@ -9,9 +9,10 @@ import {
   Users, Clock, Download, RefreshCw, Trash2, 
   Search, Plus, Check, X, Filter, Calendar, 
   ExternalLink, ArrowRight, Video, Sparkles, FileSpreadsheet, Eye, MessageCircle,
-  FileCode2, ClipboardPaste
+  FileCode2, ClipboardPaste, ChevronLeft, ChevronRight, UserCheck, RotateCcw,
+  Edit3, Sliders, UserX, ArrowUpRight, CheckSquare, XCircle, HeartHandshake
 } from 'lucide-react';
-import { collection, onSnapshot, doc, updateDoc, setDoc, addDoc, deleteDoc, serverTimestamp, getDocs, writeBatch, query, orderBy, limit } from 'firebase/firestore';
+import { collection, onSnapshot, doc, updateDoc, setDoc, addDoc, deleteDoc, serverTimestamp, getDocs, writeBatch, query, orderBy, limit, arrayRemove, arrayUnion, increment } from 'firebase/firestore';
 import { db } from '../lib/firebase';
 import { UserProfile, ZoomSessionItem, ZoomParticipantLog } from '../types';
 import { getTodayDateString } from '../lib/attendance';
@@ -30,12 +31,37 @@ interface ParsedParticipantRow {
   status: 'matched' | 'guest';
 }
 
+export interface SyncedCorrectionRow {
+  logId: string;
+  name: string;
+  email: string;
+  durationMinutes: number;
+  joinTime?: string;
+  leaveTime?: string;
+  isMember: boolean;
+  memberUid: string;
+  matchedMember: UserProfile | null;
+  whatsappCommunity?: string;
+  date: string;
+  status: 'present' | 'reversed_absent';
+}
+
+export interface SyncedSessionCorrection {
+  sessionId: string;
+  title: string;
+  date: string;
+  totalParticipants: number;
+  totalMinutes: number;
+  rows: SyncedCorrectionRow[];
+}
+
 interface ZoomAttendanceSyncProps {
   members: UserProfile[];
   onRefreshMembers?: () => void;
+  onNavigateToReports?: (date?: string, subTab?: 'reports' | 'followup') => void;
 }
 
-export default function ZoomAttendanceSync({ members, onRefreshMembers }: ZoomAttendanceSyncProps) {
+export default function ZoomAttendanceSync({ members, onRefreshMembers, onNavigateToReports }: ZoomAttendanceSyncProps) {
   const [activeSubTab, setActiveSubTab] = useState<'import' | 'manual' | 'history'>('import');
   
   // Import state
@@ -54,6 +80,42 @@ export default function ZoomAttendanceSync({ members, onRefreshMembers }: ZoomAt
   const [isPasteMode, setIsPasteMode] = useState(false);
   const [pastedText, setPastedText] = useState('');
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Pre-sync member picker modal
+  const [matchingPickerRowId, setMatchingPickerRowId] = useState<string | null>(null);
+  const [matchingPickerSearch, setMatchingPickerSearch] = useState('');
+
+  // Post-sync immediate manual correction station
+  const [syncedSessionCorrection, setSyncedSessionCorrection] = useState<SyncedSessionCorrection | null>(null);
+  const [correctionSearchFilter, setCorrectionSearchFilter] = useState('');
+  const [editingMinutesRowId, setEditingMinutesRowId] = useState<string | null>(null);
+  const [editingMinutesValue, setEditingMinutesValue] = useState<number>(60);
+  const [reassigningLogId, setReassigningLogId] = useState<string | null>(null);
+  const [reassigningSearch, setReassigningSearch] = useState('');
+
+  // History past session add member modal state
+  const [showAddMemberToSessionModal, setShowAddMemberToSessionModal] = useState(false);
+  const [addMemberSessionMemberId, setAddMemberSessionMemberId] = useState('');
+  const [addMemberSessionSearch, setAddMemberSessionSearch] = useState('');
+  const [addMemberSessionMinutes, setAddMemberSessionMinutes] = useState(60);
+  const [addingMemberToSession, setAddingMemberToSession] = useState(false);
+
+  // Table horizontal scroll refs
+  const parsedTableScrollRef = useRef<HTMLDivElement>(null);
+  const correctionTableScrollRef = useRef<HTMLDivElement>(null);
+  const historyTableScrollRef = useRef<HTMLDivElement>(null);
+
+  const handleScrollParsedTable = (direction: 'left' | 'right') => {
+    if (parsedTableScrollRef.current) {
+      parsedTableScrollRef.current.scrollBy({ left: direction === 'left' ? -350 : 350, behavior: 'smooth' });
+    }
+  };
+
+  const handleScrollCorrectionTable = (direction: 'left' | 'right') => {
+    if (correctionTableScrollRef.current) {
+      correctionTableScrollRef.current.scrollBy({ left: direction === 'left' ? -350 : 350, behavior: 'smooth' });
+    }
+  };
 
   // Manual fast logger state
   const [manualName, setManualName] = useState('');
@@ -903,7 +965,33 @@ export default function ZoomAttendanceSync({ members, onRefreshMembers }: ZoomAt
     setParsedRows(prev => prev.filter(r => r.id !== rowId));
   };
 
-  // Sync to Database
+  // Pre-sync row member matching handlers
+  const handleAssignRowMember = (rowId: string, member: UserProfile) => {
+    setParsedRows(prev => prev.map(r => {
+      if (r.id !== rowId) return r;
+      return {
+        ...r,
+        matchedMember: member,
+        whatsappCommunity: getMemberWhatsAppCommunity(member),
+        status: 'matched'
+      };
+    }));
+    setMatchingPickerRowId(null);
+  };
+
+  const handleUnlinkRowToGuest = (rowId: string) => {
+    setParsedRows(prev => prev.map(r => {
+      if (r.id !== rowId) return r;
+      return {
+        ...r,
+        matchedMember: null,
+        status: 'guest'
+      };
+    }));
+    setMatchingPickerRowId(null);
+  };
+
+  // Sync to Database & Activate Post-Sync Correction Station
   const handleCommitSync = async () => {
     if (parsedRows.length === 0) {
       setSyncErrorMsg('No parsed rows to sync.');
@@ -935,10 +1023,26 @@ export default function ZoomAttendanceSync({ members, onRefreshMembers }: ZoomAt
       // 2. Commit Individual Participant Logs and Member/Guest Record Updates
       const batch = writeBatch(db);
       let batchCount = 0;
+      const createdLogs: SyncedCorrectionRow[] = [];
 
       for (const row of parsedRows) {
         // Participant log
         const logDocRef = doc(collection(db, 'zoom_participant_logs'));
+        createdLogs.push({
+          logId: logDocRef.id,
+          name: row.name,
+          email: row.email || '',
+          durationMinutes: row.durationMinutes,
+          joinTime: row.joinTime || '',
+          leaveTime: row.leaveTime || '',
+          isMember: !!row.matchedMember,
+          memberUid: row.matchedMember?.uid || '',
+          matchedMember: row.matchedMember,
+          whatsappCommunity: row.whatsappCommunity || (row.matchedMember ? getMemberWhatsAppCommunity(row.matchedMember) : ''),
+          date: meetingDate,
+          status: 'present'
+        });
+
         batch.set(logDocRef, {
           sessionId: sessionId,
           sessionTitle: meetingTitle.trim(),
@@ -1035,17 +1139,368 @@ export default function ZoomAttendanceSync({ members, onRefreshMembers }: ZoomAt
       }
 
       const todayBadge = isToday ? "Today's Attendance" : `Session Date: ${meetingDate}`;
-      setSyncSuccessMsg(`🎉 Success! Recorded attendance for ${parsedRows.length} participants (${totalSessionMinutes} total prayer minutes credited for ${todayBadge}) into the database!`);
+      setSyncSuccessMsg(`🎉 Success! Recorded attendance for ${parsedRows.length} participants (${totalSessionMinutes} total prayer minutes credited for ${todayBadge}) into the database! Review or make corrections below.`);
+
+      // Keep in active correction station
+      setSyncedSessionCorrection({
+        sessionId: sessionId,
+        title: meetingTitle.trim(),
+        date: meetingDate,
+        totalParticipants: parsedRows.length,
+        totalMinutes: totalSessionMinutes,
+        rows: createdLogs
+      });
+
       setParsedRows([]);
       setRawFileName(null);
       if (fileInputRef.current) fileInputRef.current.value = '';
       if (onRefreshMembers) onRefreshMembers();
-      setTimeout(() => setSyncSuccessMsg(''), 8000);
     } catch (err: any) {
       console.error('Error committing sync to Firestore:', err);
       setSyncErrorMsg(`Sync failed: ${err?.message || 'Could not write to database. Please check your internet connection.'}`);
     } finally {
       setIsSyncing(false);
+    }
+  };
+
+  // Immediate manual error correction: Toggle or explicitly set attendance status (Present or Absent)
+  const handleToggleSyncedRowAttendance = async (item: SyncedCorrectionRow, forceTargetStatus?: 'present' | 'reversed_absent') => {
+    try {
+      const isCurrentlyPresent = item.status === 'present';
+      if (forceTargetStatus) {
+        if (forceTargetStatus === 'present' && isCurrentlyPresent) return;
+        if (forceTargetStatus === 'reversed_absent' && !isCurrentlyPresent) return;
+      }
+      const newStatus: 'present' | 'reversed_absent' = forceTargetStatus || (isCurrentlyPresent ? 'reversed_absent' : 'present');
+
+      // 1. Update Zoom participant log doc
+      if (item.logId) {
+        await updateDoc(doc(db, 'zoom_participant_logs', item.logId), {
+          status: newStatus
+        });
+      }
+
+      // 2. If registered member, adjust user record in Firestore
+      if (item.memberUid) {
+        const userRef = doc(db, 'users', item.memberUid);
+        const mem = members.find(m => m.uid === item.memberUid);
+        if (mem) {
+          const isToday = item.date === getTodayDateString();
+          const currentDaysList = Array.isArray(mem.attendanceDaysList) ? [...mem.attendanceDaysList] : [];
+          const currentDailyMap = mem.dailyMinutes ? { ...mem.dailyMinutes } : {};
+
+          if (isCurrentlyPresent) {
+            // Reversing to ABSENT: remove date from list and delete daily minutes
+            delete currentDailyMap[item.date];
+            await updateDoc(userRef, {
+              attendanceDaysList: arrayRemove(item.date),
+              attendanceCount: Math.max(0, (mem.attendanceCount || currentDaysList.length) - 1),
+              totalMinutes: Math.max(0, (mem.totalMinutes || 0) - item.durationMinutes),
+              dailyMinutes: currentDailyMap,
+              manualAdjustmentNote: `Reversed Zoom credit to ABSENT on ${new Date().toLocaleDateString()}`,
+              ...(isToday ? { todayMinutes: Math.max(0, (mem.todayMinutes || 0) - item.durationMinutes) } : {})
+            });
+          } else {
+            // Restoring back to PRESENT
+            const isNewDay = !currentDaysList.includes(item.date);
+            currentDailyMap[item.date] = item.durationMinutes;
+            await updateDoc(userRef, {
+              attendanceDaysList: arrayUnion(item.date),
+              lastAttendedDate: item.date,
+              attendanceCount: increment(isNewDay ? 1 : 0),
+              totalMinutes: (mem.totalMinutes || 0) + item.durationMinutes,
+              dailyMinutes: currentDailyMap,
+              manualAdjustmentNote: `Restored Zoom credit to PRESENT on ${new Date().toLocaleDateString()}`,
+              ...(isToday ? { todayMinutes: (mem.todayMinutes || 0) + item.durationMinutes } : {})
+            });
+          }
+        }
+      }
+
+      // 3. Update local state
+      setSyncedSessionCorrection(prev => {
+        if (!prev) return null;
+        return {
+          ...prev,
+          rows: prev.rows.map(r => r.logId === item.logId ? { ...r, status: newStatus } : r)
+        };
+      });
+
+      if (onRefreshMembers) onRefreshMembers();
+      setSyncSuccessMsg(isCurrentlyPresent 
+        ? `Reversed "${item.name}" to ABSENT. Attendance day and ${item.durationMinutes}m subtracted.`
+        : `Restored "${item.name}" to PRESENT (${item.durationMinutes}m credited).`
+      );
+      setTimeout(() => setSyncSuccessMsg(''), 5000);
+    } catch (err: any) {
+      console.error('Error toggling attendance for synced participant:', err);
+      setSyncErrorMsg('Failed to update record: ' + err?.message);
+    }
+  };
+
+  // Immediate manual error correction: Adjust prayer duration
+  const handleAdjustSyncedRowMinutes = async (item: SyncedCorrectionRow, newMinutes: number) => {
+    if (newMinutes <= 0 || newMinutes === item.durationMinutes) {
+      setEditingMinutesRowId(null);
+      return;
+    }
+    const diff = newMinutes - item.durationMinutes;
+    try {
+      if (item.logId) {
+        await updateDoc(doc(db, 'zoom_participant_logs', item.logId), {
+          durationMinutes: newMinutes
+        });
+      }
+
+      if (item.memberUid && item.status === 'present') {
+        const userRef = doc(db, 'users', item.memberUid);
+        const mem = members.find(m => m.uid === item.memberUid);
+        if (mem) {
+          const isToday = item.date === getTodayDateString();
+          const currentDailyMap = mem.dailyMinutes ? { ...mem.dailyMinutes } : {};
+          currentDailyMap[item.date] = newMinutes;
+
+          await updateDoc(userRef, {
+            totalMinutes: Math.max(0, (mem.totalMinutes || 0) + diff),
+            dailyMinutes: currentDailyMap,
+            manualAdjustmentNote: `Adjusted Zoom minutes to ${newMinutes}m on ${new Date().toLocaleDateString()}`,
+            ...(isToday ? { todayMinutes: Math.max(0, (mem.todayMinutes || 0) + diff) } : {})
+          });
+        }
+      }
+
+      setSyncedSessionCorrection(prev => {
+        if (!prev) return null;
+        return {
+          ...prev,
+          totalMinutes: prev.totalMinutes + diff,
+          rows: prev.rows.map(r => r.logId === item.logId ? { ...r, durationMinutes: newMinutes } : r)
+        };
+      });
+
+      setEditingMinutesRowId(null);
+      if (onRefreshMembers) onRefreshMembers();
+      setSyncSuccessMsg(`Updated duration for "${item.name}" to ${newMinutes} minutes.`);
+      setTimeout(() => setSyncSuccessMsg(''), 4000);
+    } catch (err: any) {
+      console.error('Error adjusting minutes:', err);
+      setSyncErrorMsg('Failed to adjust duration: ' + err?.message);
+    }
+  };
+
+  // Immediate manual error correction: Reassign participant to another member
+  const handleReassignSyncedRowMember = async (item: SyncedCorrectionRow, targetMember: UserProfile) => {
+    try {
+      const isToday = item.date === getTodayDateString();
+
+      // 1. Remove from old member if previously assigned and active
+      if (item.memberUid && item.status === 'present') {
+        const oldMem = members.find(m => m.uid === item.memberUid);
+        if (oldMem) {
+          const currentDaysList = Array.isArray(oldMem.attendanceDaysList) ? [...oldMem.attendanceDaysList] : [];
+          const currentDailyMap = oldMem.dailyMinutes ? { ...oldMem.dailyMinutes } : {};
+          delete currentDailyMap[item.date];
+
+          await updateDoc(doc(db, 'users', item.memberUid), {
+            attendanceDaysList: arrayRemove(item.date),
+            attendanceCount: Math.max(0, (oldMem.attendanceCount || currentDaysList.length) - 1),
+            totalMinutes: Math.max(0, (oldMem.totalMinutes || 0) - item.durationMinutes),
+            dailyMinutes: currentDailyMap,
+            manualAdjustmentNote: `Reassigned Zoom credit away to ${targetMember.displayName || targetMember.email}`,
+            ...(isToday ? { todayMinutes: Math.max(0, (oldMem.todayMinutes || 0) - item.durationMinutes) } : {})
+          });
+        }
+      }
+
+      // 2. Add credit to new member
+      const newUid = targetMember.uid;
+      if (newUid && item.status === 'present') {
+        const currentDaysList = Array.isArray(targetMember.attendanceDaysList) ? [...targetMember.attendanceDaysList] : [];
+        const currentDailyMap = targetMember.dailyMinutes ? { ...targetMember.dailyMinutes } : {};
+        const isNewDay = !currentDaysList.includes(item.date);
+        currentDailyMap[item.date] = item.durationMinutes;
+
+        await updateDoc(doc(db, 'users', newUid), {
+          attendanceDaysList: arrayUnion(item.date),
+          lastAttendedDate: item.date,
+          attendanceCount: increment(isNewDay ? 1 : 0),
+          totalMinutes: (targetMember.totalMinutes || 0) + item.durationMinutes,
+          dailyMinutes: currentDailyMap,
+          manualAdjustmentNote: `Reassigned Zoom credit from ${item.name}`,
+          ...(isToday ? { todayMinutes: (targetMember.todayMinutes || 0) + item.durationMinutes } : {})
+        });
+      }
+
+      // 3. Update log in Firestore
+      if (item.logId) {
+        await updateDoc(doc(db, 'zoom_participant_logs', item.logId), {
+          isMember: true,
+          memberUid: targetMember.uid,
+          name: targetMember.displayName || item.name,
+          whatsappCommunity: getMemberWhatsAppCommunity(targetMember),
+          status: item.status === 'present' ? 'synced' : 'reversed_absent'
+        });
+      }
+
+      // 4. Update local state
+      setSyncedSessionCorrection(prev => {
+        if (!prev) return null;
+        return {
+          ...prev,
+          rows: prev.rows.map(r => r.logId === item.logId ? {
+            ...r,
+            isMember: true,
+            memberUid: targetMember.uid,
+            matchedMember: targetMember,
+            whatsappCommunity: getMemberWhatsAppCommunity(targetMember)
+          } : r)
+        };
+      });
+
+      setReassigningLogId(null);
+      if (onRefreshMembers) onRefreshMembers();
+      setSyncSuccessMsg(`Reassigned attendance credit to "${targetMember.displayName || targetMember.email}".`);
+      setTimeout(() => setSyncSuccessMsg(''), 4000);
+    } catch (err: any) {
+      console.error('Error reassigning member:', err);
+      setSyncErrorMsg('Failed to reassign member: ' + err?.message);
+    }
+  };
+
+  // Toggle or explicitly set past session log attendance in History modal
+  const handleTogglePastSessionLog = async (log: ZoomParticipantLog, forceTargetStatus?: 'present' | 'reversed_absent') => {
+    try {
+      const isCurrentlyPresent = log.status !== 'reversed_absent';
+      if (forceTargetStatus) {
+        if (forceTargetStatus === 'present' && isCurrentlyPresent) return;
+        if (forceTargetStatus === 'reversed_absent' && !isCurrentlyPresent) return;
+      }
+      const newStatus: 'synced' | 'reversed_absent' = (forceTargetStatus === 'present')
+        ? 'synced'
+        : (forceTargetStatus === 'reversed_absent')
+          ? 'reversed_absent'
+          : (isCurrentlyPresent ? 'reversed_absent' : 'synced');
+
+      if (log.id) {
+        await updateDoc(doc(db, 'zoom_participant_logs', log.id), {
+          status: newStatus
+        });
+      }
+
+      if (log.memberUid && log.date) {
+        const userRef = doc(db, 'users', log.memberUid);
+        const mem = members.find(m => m.uid === log.memberUid);
+        if (mem) {
+          const isToday = log.date === getTodayDateString();
+          const currentDaysList = Array.isArray(mem.attendanceDaysList) ? [...mem.attendanceDaysList] : [];
+          const currentDailyMap = mem.dailyMinutes ? { ...mem.dailyMinutes } : {};
+
+          if (isCurrentlyPresent) {
+            delete currentDailyMap[log.date];
+            await updateDoc(userRef, {
+              attendanceDaysList: arrayRemove(log.date),
+              attendanceCount: Math.max(0, (mem.attendanceCount || currentDaysList.length) - 1),
+              totalMinutes: Math.max(0, (mem.totalMinutes || 0) - log.durationMinutes),
+              dailyMinutes: currentDailyMap,
+              manualAdjustmentNote: `Reversed history Zoom log on ${new Date().toLocaleDateString()}`,
+              ...(isToday ? { todayMinutes: Math.max(0, (mem.todayMinutes || 0) - log.durationMinutes) } : {})
+            });
+          } else {
+            const isNewDay = !currentDaysList.includes(log.date);
+            currentDailyMap[log.date] = log.durationMinutes;
+            await updateDoc(userRef, {
+              attendanceDaysList: arrayUnion(log.date),
+              lastAttendedDate: log.date,
+              attendanceCount: increment(isNewDay ? 1 : 0),
+              totalMinutes: (mem.totalMinutes || 0) + log.durationMinutes,
+              dailyMinutes: currentDailyMap,
+              manualAdjustmentNote: `Restored history Zoom log on ${new Date().toLocaleDateString()}`,
+              ...(isToday ? { todayMinutes: (mem.todayMinutes || 0) + log.durationMinutes } : {})
+            });
+          }
+        }
+      }
+
+      setSessionLogs(prev => prev.map(l => l.id === log.id ? { ...l, status: newStatus } : l));
+      if (onRefreshMembers) onRefreshMembers();
+      setSyncSuccessMsg(isCurrentlyPresent 
+        ? `Reversed "${log.name}" to ABSENT in this session.`
+        : `Restored "${log.name}" to PRESENT.`
+      );
+      setTimeout(() => setSyncSuccessMsg(''), 4000);
+    } catch (err: any) {
+      console.error('Error updating past log:', err);
+      setSyncErrorMsg('Failed to update log: ' + err?.message);
+    }
+  };
+
+  // Add missed member to past session in History modal
+  const handleAddMissedMemberToSession = async () => {
+    if (!selectedSession || !addMemberSessionMemberId) return;
+    const targetMember = members.find(m => m.uid === addMemberSessionMemberId);
+    if (!targetMember) return;
+
+    setAddingMemberToSession(true);
+    try {
+      const isToday = selectedSession.meetingDate === getTodayDateString();
+      const minutes = Number(addMemberSessionMinutes) || 60;
+
+      // 1. Add log
+      const logRef = await addDoc(collection(db, 'zoom_participant_logs'), {
+        sessionId: selectedSession.id,
+        sessionTitle: selectedSession.title,
+        name: targetMember.displayName || targetMember.email,
+        email: targetMember.email || '',
+        durationMinutes: minutes,
+        date: selectedSession.meetingDate,
+        isMember: true,
+        memberUid: targetMember.uid,
+        whatsappCommunity: getMemberWhatsAppCommunity(targetMember),
+        status: 'synced',
+        createdAt: serverTimestamp()
+      });
+
+      // 2. Update user
+      const userRef = doc(db, 'users', targetMember.uid);
+      const currentDaysList = Array.isArray(targetMember.attendanceDaysList) ? [...targetMember.attendanceDaysList] : [];
+      const currentDailyMap = targetMember.dailyMinutes ? { ...targetMember.dailyMinutes } : {};
+      const isNewDay = !currentDaysList.includes(selectedSession.meetingDate);
+      currentDailyMap[selectedSession.meetingDate] = minutes;
+
+      await updateDoc(userRef, {
+        attendanceDaysList: arrayUnion(selectedSession.meetingDate),
+        lastAttendedDate: selectedSession.meetingDate,
+        attendanceCount: increment(isNewDay ? 1 : 0),
+        totalMinutes: (targetMember.totalMinutes || 0) + minutes,
+        dailyMinutes: currentDailyMap,
+        manualAdjustmentNote: `Added to session ${selectedSession.title} on ${new Date().toLocaleDateString()}`,
+        ...(isToday ? { todayMinutes: (targetMember.todayMinutes || 0) + minutes } : {})
+      });
+
+      // 3. Update session doc totals
+      await updateDoc(doc(db, 'zoom_sessions', selectedSession.id), {
+        totalParticipants: increment(1),
+        totalMinutes: increment(minutes)
+      });
+
+      // Update local state
+      setSelectedSession(prev => prev ? {
+        ...prev,
+        totalParticipants: prev.totalParticipants + 1,
+        totalMinutes: prev.totalMinutes + minutes
+      } : null);
+
+      setShowAddMemberToSessionModal(false);
+      setAddMemberSessionMemberId('');
+      setAddMemberSessionSearch('');
+      if (onRefreshMembers) onRefreshMembers();
+      setSyncSuccessMsg(`Added ${targetMember.displayName || targetMember.email} to session.`);
+      setTimeout(() => setSyncSuccessMsg(''), 4000);
+    } catch (err: any) {
+      console.error('Error adding member to session:', err);
+      setSyncErrorMsg('Failed to add member: ' + err?.message);
+    } finally {
+      setAddingMemberToSession(false);
     }
   };
 
@@ -1503,6 +1958,29 @@ export default function ZoomAttendanceSync({ members, onRefreshMembers }: ZoomAt
                 </div>
 
                 <div className="flex flex-wrap items-center gap-2">
+                  {/* Stable horizontal scroll buttons */}
+                  <div className="flex items-center space-x-1.5 bg-gray-100 p-1 rounded-xl">
+                    <span className="text-[10px] font-black uppercase text-gray-400 px-1 hidden sm:inline">Columns:</span>
+                    <button
+                      type="button"
+                      onClick={() => handleScrollParsedTable('left')}
+                      className="px-2.5 py-1 bg-white hover:bg-gray-50 text-[#1A1F3C] rounded-lg text-xs font-bold border border-gray-200 cursor-pointer shadow-xs active:scale-95 flex items-center space-x-1"
+                      title="Scroll table left"
+                    >
+                      <ChevronLeft size={13} />
+                      <span>Left</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleScrollParsedTable('right')}
+                      className="px-2.5 py-1 bg-[#1A1F3C] hover:bg-[#282E5C] text-white rounded-lg text-xs font-bold cursor-pointer shadow-xs active:scale-95 flex items-center space-x-1"
+                      title="Scroll table right to see all actions"
+                    >
+                      <span>Right</span>
+                      <ChevronRight size={13} className="text-[#F26522]" />
+                    </button>
+                  </div>
+
                   <button
                     type="button"
                     onClick={handleAddParticipantRow}
@@ -1589,29 +2067,34 @@ export default function ZoomAttendanceSync({ members, onRefreshMembers }: ZoomAt
                 </div>
               )}
 
-              {/* Table */}
-              <div className="overflow-x-auto">
-                <table className="w-full text-left border-collapse">
+              {/* Table with stable custom scrollbar and sticky columns */}
+              <div 
+                ref={parsedTableScrollRef}
+                className="overflow-x-auto max-h-[520px] overflow-y-auto rounded-2xl border border-gray-200 shadow-xs bg-white custom-scrollbar relative"
+                style={{ WebkitOverflowScrolling: 'touch' }}
+              >
+                <table className="min-w-[1080px] w-full text-left border-collapse text-xs">
                   <thead>
-                    <tr className="bg-gray-50 border-b border-gray-100 text-[10px] font-black uppercase tracking-widest text-gray-400">
-                      <th className="p-4">Participant Name</th>
-                      <th className="p-4">Email</th>
-                      <th className="p-4">WhatsApp Community</th>
-                      <th className="p-4">Classification</th>
-                      <th className="p-4">Duration (Mins)</th>
-                      <th className="p-4">Join / Leave Time</th>
-                      <th className="p-4 text-right">Action</th>
+                    <tr className="bg-gray-50 text-gray-600 font-black uppercase tracking-wider border-b border-gray-200">
+                      <th className="sticky left-0 top-0 z-30 bg-gray-50 p-4 border-r border-b border-gray-200 shadow-[2px_0_4px_rgba(0,0,0,0.05)] min-w-[220px]">Participant Name</th>
+                      <th className="sticky top-0 z-20 bg-gray-50 p-4 border-b border-gray-200 min-w-[180px]">Email</th>
+                      <th className="sticky top-0 z-20 bg-gray-50 p-4 border-b border-gray-200 min-w-[180px]">WhatsApp Community</th>
+                      <th className="sticky top-0 z-20 bg-gray-50 p-4 border-b border-gray-200 min-w-[170px]">Classification & Match</th>
+                      <th className="sticky top-0 z-20 bg-gray-50 p-4 border-b border-gray-200 text-center min-w-[130px]">Duration (Mins)</th>
+                      <th className="sticky top-0 z-20 bg-gray-50 p-4 border-b border-gray-200 min-w-[150px]">Join / Leave Time</th>
+                      <th className="sticky top-0 z-20 bg-gray-50 p-4 border-b border-gray-200 text-right min-w-[100px]">Action</th>
                     </tr>
                   </thead>
-                  <tbody className="divide-y divide-gray-100 text-sm">
+                  <tbody className="divide-y divide-gray-100 text-xs font-medium">
                     {filteredParsedRows.map((row) => (
-                      <tr key={row.id} className="hover:bg-gray-50/50">
-                        <td className="p-4 font-bold text-[#1A1F3C]">
+                      <tr key={row.id} className="hover:bg-gray-50/80 transition-colors">
+                        {/* Sticky Name Column */}
+                        <td className="sticky left-0 z-10 p-4 font-bold text-[#1A1F3C] bg-white border-r border-gray-200 shadow-[2px_0_4px_rgba(0,0,0,0.05)] min-w-[220px]">
                           <div className="flex items-center space-x-2">
                             <span className="w-8 h-8 rounded-full bg-[#1A1F3C] text-white text-xs font-black flex items-center justify-center shrink-0">
                               {row.name.charAt(0).toUpperCase() || 'P'}
                             </span>
-                            <div className="flex-1 min-w-[180px]">
+                            <div className="flex-1 min-w-[150px]">
                               <input
                                 type="text"
                                 value={row.name}
@@ -1619,14 +2102,21 @@ export default function ZoomAttendanceSync({ members, onRefreshMembers }: ZoomAt
                                 className="w-full font-black text-xs px-2 py-1 bg-transparent hover:bg-gray-100 focus:bg-white focus:ring-1 focus:ring-[#F26522] rounded-lg outline-none transition-colors border border-transparent hover:border-gray-200"
                                 placeholder="Attendee Name"
                               />
-                              {row.matchedMember && (
-                                <p className="text-[10px] text-emerald-600 font-bold px-2 mt-0.5">
-                                  Matched: {row.matchedMember.displayName || row.matchedMember.email}
+                              {row.matchedMember ? (
+                                <p className="text-[10px] text-emerald-600 font-bold px-2 mt-0.5 flex items-center space-x-1">
+                                  <Check size={11} className="inline text-emerald-600 shrink-0" />
+                                  <span className="truncate">Matched: {row.matchedMember.displayName || row.matchedMember.email}</span>
+                                </p>
+                              ) : (
+                                <p className="text-[10px] text-purple-600 font-bold px-2 mt-0.5">
+                                  Guest Visitor (No member account)
                                 </p>
                               )}
                             </div>
                           </div>
                         </td>
+
+                        {/* Email */}
                         <td className="p-4 font-mono text-xs text-gray-500 min-w-[180px]">
                           <input
                             type="email"
@@ -1636,7 +2126,9 @@ export default function ZoomAttendanceSync({ members, onRefreshMembers }: ZoomAt
                             className="w-full px-2 py-1 bg-transparent hover:bg-gray-100 focus:bg-white focus:ring-1 focus:ring-[#F26522] rounded-lg outline-none transition-colors border border-transparent hover:border-gray-200 text-xs font-mono"
                           />
                         </td>
-                        <td className="p-4">
+
+                        {/* Community */}
+                        <td className="p-4 min-w-[180px]">
                           {row.matchedMember ? (
                             <span className="inline-flex items-center space-x-1 px-2.5 py-1 bg-emerald-50 text-emerald-800 text-[10px] font-black uppercase tracking-wider rounded-lg border border-emerald-200">
                               <MessageCircle size={11} className="text-emerald-600 shrink-0" />
@@ -1658,37 +2150,66 @@ export default function ZoomAttendanceSync({ members, onRefreshMembers }: ZoomAt
                             </select>
                           )}
                         </td>
-                        <td className="p-4">
-                          {row.status === 'matched' ? (
-                            <span className="inline-flex items-center space-x-1 px-2.5 py-1 bg-emerald-100 text-emerald-800 text-[10px] font-black uppercase rounded-full">
-                              <CheckCircle2 size={12} />
-                              <span>Registered Member</span>
-                            </span>
-                          ) : (
-                            <span className="inline-flex items-center space-x-1 px-2.5 py-1 bg-purple-100 text-purple-800 text-[10px] font-black uppercase rounded-full">
-                              <Users size={12} />
-                              <span>Guest / Visitor</span>
-                            </span>
-                          )}
+
+                        {/* Classification & Member Match Picker */}
+                        <td className="p-4 min-w-[170px]">
+                          <div className="space-y-1.5">
+                            {row.status === 'matched' ? (
+                              <span className="inline-flex items-center space-x-1 px-2.5 py-1 bg-emerald-100 text-emerald-800 text-[10px] font-black uppercase rounded-full">
+                                <CheckCircle2 size={12} />
+                                <span>Registered Member</span>
+                              </span>
+                            ) : (
+                              <span className="inline-flex items-center space-x-1 px-2.5 py-1 bg-purple-100 text-purple-800 text-[10px] font-black uppercase rounded-full">
+                                <Users size={12} />
+                                <span>Guest / Visitor</span>
+                              </span>
+                            )}
+
+                            {/* Button to manually pick or change member match */}
+                            <div>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setMatchingPickerRowId(row.id);
+                                  setMatchingPickerSearch(row.name);
+                                }}
+                                className="px-2 py-0.5 rounded text-[10px] font-bold bg-gray-100 hover:bg-gray-200 text-gray-700 flex items-center space-x-1 transition-colors cursor-pointer"
+                                title="Click to manually assign or change church member account"
+                              >
+                                <UserCheck size={11} className="text-[#F26522]" />
+                                <span>{row.matchedMember ? 'Change Match' : 'Match to Member'}</span>
+                              </button>
+                            </div>
+                          </div>
                         </td>
-                        <td className="p-4">
-                          <input
-                            type="number"
-                            min="1"
-                            max="720"
-                            value={row.durationMinutes}
-                            onChange={(e) => handleRowDurationChange(row.id, parseInt(e.target.value) || 1)}
-                            className="w-20 px-2 py-1 bg-gray-50 border rounded-lg text-xs font-mono font-bold text-[#1A1F3C] text-center"
-                          />
+
+                        {/* Duration with quick adjustment */}
+                        <td className="p-4 text-center min-w-[130px]">
+                          <div className="inline-flex items-center space-x-1">
+                            <input
+                              type="number"
+                              min="1"
+                              max="720"
+                              value={row.durationMinutes}
+                              onChange={(e) => handleRowDurationChange(row.id, parseInt(e.target.value) || 1)}
+                              className="w-16 px-2 py-1 bg-gray-50 border rounded-lg text-xs font-mono font-bold text-[#1A1F3C] text-center"
+                            />
+                            <span className="text-[10px] font-bold text-gray-400">min</span>
+                          </div>
                         </td>
-                        <td className="p-4 text-xs font-mono text-gray-400">
+
+                        {/* Join / Leave Time */}
+                        <td className="p-4 text-xs font-mono text-gray-400 min-w-[150px]">
                           {row.joinTime || row.leaveTime ? (
                             <span>{row.joinTime || '—'} to {row.leaveTime || '—'}</span>
                           ) : (
                             <span>Session Duration</span>
                           )}
                         </td>
-                        <td className="p-4 text-right">
+
+                        {/* Action: Delete Row */}
+                        <td className="p-4 text-right min-w-[100px]">
                           <button
                             onClick={() => handleRemoveRow(row.id)}
                             className="p-1.5 text-red-500 hover:bg-red-50 rounded-lg transition-colors cursor-pointer"
@@ -1699,6 +2220,322 @@ export default function ZoomAttendanceSync({ members, onRefreshMembers }: ZoomAt
                         </td>
                       </tr>
                     ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
+          {/* ========================================================================= */}
+          {/* IMMEDIATE POST-SYNC ATTENDANCE REVIEW & MANUAL ERROR CORRECTION STATION */}
+          {/* ========================================================================= */}
+          {syncedSessionCorrection && (
+            <div className="bg-white rounded-3xl border-2 border-emerald-500/30 shadow-lg p-6 sm:p-8 space-y-6 animate-in fade-in">
+              {/* Header banner */}
+              <div className="bg-gradient-to-r from-emerald-900 to-teal-950 text-white p-6 rounded-2xl space-y-3">
+                <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+                  <div className="space-y-1">
+                    <div className="inline-flex items-center space-x-1.5 px-3 py-1 rounded-full bg-emerald-500/20 text-emerald-300 text-[10px] font-black uppercase tracking-wider border border-emerald-500/30">
+                      <CheckCircle2 size={13} />
+                      <span>Attendance Successfully Recorded to Database</span>
+                    </div>
+                    <h3 className="text-xl sm:text-2xl font-black">
+                      {syncedSessionCorrection.title}
+                    </h3>
+                    <p className="text-emerald-200 text-xs sm:text-sm max-w-2xl">
+                      Attendance for <strong>{syncedSessionCorrection.rows.length} participants</strong> has been synchronized for date <strong>{syncedSessionCorrection.date}</strong>. If there are any system errors, you can manually reverse attendance to Absent, adjust prayer duration, or reassign members below right now.
+                    </p>
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-2 self-start md:self-center">
+                    {onNavigateToReports && (
+                      <>
+                        <button
+                          type="button"
+                          onClick={() => onNavigateToReports(syncedSessionCorrection.date, 'reports')}
+                          className="px-4 py-2.5 bg-white text-[#1A1F3C] hover:bg-gray-100 rounded-xl text-xs font-black uppercase tracking-wider transition-all flex items-center space-x-1.5 cursor-pointer shadow-md"
+                        >
+                          <ExternalLink size={14} className="text-[#F26522]" />
+                          <span>Open in Attendance Hub Roster</span>
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={() => onNavigateToReports(syncedSessionCorrection.date, 'followup')}
+                          className="px-4 py-2.5 bg-rose-600 hover:bg-rose-700 text-white rounded-xl text-xs font-black uppercase tracking-wider transition-all flex items-center space-x-1.5 cursor-pointer shadow-md"
+                          title="View and contact members who did not attend this prayer session"
+                        >
+                          <HeartHandshake size={14} className="text-white" />
+                          <span>Follow Up Absent Members</span>
+                        </button>
+                      </>
+                    )}
+
+                    <button
+                      type="button"
+                      onClick={() => setSyncedSessionCorrection(null)}
+                      className="px-4 py-2.5 bg-white/10 hover:bg-white/20 text-white rounded-xl text-xs font-bold transition-all border border-white/20 cursor-pointer"
+                    >
+                      <span>Done / Start New Import</span>
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              {/* Correction Table Header & Search */}
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                <div className="relative flex-1 max-w-sm">
+                  <Search size={16} className="absolute left-3.5 top-1/2 -translate-y-1/2 text-gray-400" />
+                  <input
+                    type="text"
+                    value={correctionSearchFilter}
+                    onChange={(e) => setCorrectionSearchFilter(e.target.value)}
+                    placeholder="Search synced attendees to correct..."
+                    className="w-full pl-10 pr-4 py-2.5 bg-gray-50 rounded-xl text-xs font-bold border outline-none focus:ring-2 focus:ring-[#F26522]"
+                  />
+                </div>
+
+                <div className="flex items-center space-x-2">
+                  {/* Stable horizontal scroll buttons */}
+                  <div className="flex items-center space-x-1.5 bg-gray-100 p-1 rounded-xl">
+                    <span className="text-[10px] font-black uppercase text-gray-400 px-1 hidden sm:inline">Columns:</span>
+                    <button
+                      type="button"
+                      onClick={() => handleScrollCorrectionTable('left')}
+                      className="px-2.5 py-1 bg-white hover:bg-gray-50 text-[#1A1F3C] rounded-lg text-xs font-bold border border-gray-200 cursor-pointer shadow-xs active:scale-95 flex items-center space-x-1"
+                    >
+                      <ChevronLeft size={13} />
+                      <span>Left</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleScrollCorrectionTable('right')}
+                      className="px-2.5 py-1 bg-[#1A1F3C] hover:bg-[#282E5C] text-white rounded-lg text-xs font-bold cursor-pointer shadow-xs active:scale-95 flex items-center space-x-1"
+                    >
+                      <span>Right</span>
+                      <ChevronRight size={13} className="text-[#F26522]" />
+                    </button>
+                  </div>
+
+                  <span className="text-xs font-bold text-gray-500">
+                    {syncedSessionCorrection.rows.filter(r => r.status === 'present').length} Present • {syncedSessionCorrection.rows.filter(r => r.status === 'reversed_absent').length} Reversed Absent
+                  </span>
+                </div>
+              </div>
+
+              {/* Correction Table */}
+              <div 
+                ref={correctionTableScrollRef}
+                className="overflow-x-auto max-h-[520px] overflow-y-auto rounded-2xl border border-gray-200 shadow-xs bg-white custom-scrollbar relative"
+                style={{ WebkitOverflowScrolling: 'touch' }}
+              >
+                <table className="min-w-[1080px] w-full text-left border-collapse text-xs">
+                  <thead>
+                    <tr className="bg-gray-50 text-gray-600 font-black uppercase tracking-wider border-b border-gray-200">
+                      <th className="sticky left-0 top-0 z-30 bg-gray-50 p-4 border-r border-b border-gray-200 shadow-[2px_0_4px_rgba(0,0,0,0.05)] min-w-[230px]">Attendee Name</th>
+                      <th className="sticky top-0 z-20 bg-gray-50 p-4 border-b border-gray-200 min-w-[210px] text-center">Manual Correction (Present / Absent)</th>
+                      <th className="sticky top-0 z-20 bg-gray-50 p-4 border-b border-gray-200 min-w-[150px]">Current Status</th>
+                      <th className="sticky top-0 z-20 bg-gray-50 p-4 border-b border-gray-200 min-w-[180px]">Member Account</th>
+                      <th className="sticky top-0 z-20 bg-gray-50 p-4 border-b border-gray-200 min-w-[160px]">WhatsApp Group</th>
+                      <th className="sticky top-0 z-20 bg-gray-50 p-4 border-b border-gray-200 text-center min-w-[140px]">Prayer Duration</th>
+                      <th className="sticky top-0 z-20 bg-gray-50 p-4 border-b border-gray-200 text-right min-w-[110px]">Reassign</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-gray-100 text-xs font-medium">
+                    {syncedSessionCorrection.rows
+                      .filter(r => {
+                        if (!correctionSearchFilter) return true;
+                        const q = correctionSearchFilter.toLowerCase();
+                        return r.name.toLowerCase().includes(q) || r.email.toLowerCase().includes(q);
+                      })
+                      .map((row) => {
+                        const isPresent = row.status === 'present';
+                        const isEditingMins = editingMinutesRowId === row.logId;
+
+                        return (
+                          <tr key={row.logId} className={cn("hover:bg-gray-50/80 transition-colors", !isPresent && "bg-rose-50/30")}>
+                            {/* Sticky Name with direct Present and Absent buttons against each name */}
+                            <td className="sticky left-0 z-10 p-4 font-bold text-[#1A1F3C] bg-white border-r border-gray-200 shadow-[2px_0_4px_rgba(0,0,0,0.05)] min-w-[230px]">
+                              <div className="flex items-start space-x-2">
+                                <span className={cn(
+                                  "w-7 h-7 rounded-full text-white text-xs font-black flex items-center justify-center shrink-0 mt-0.5",
+                                  isPresent ? "bg-[#1A1F3C]" : "bg-rose-500"
+                                )}>
+                                  {row.name.charAt(0).toUpperCase()}
+                                </span>
+                                <div className="space-y-1">
+                                  <p className="font-black text-sm text-[#1A1F3C] leading-snug">{row.name}</p>
+                                  {row.email && <p className="text-[10px] text-gray-400 font-mono leading-none">{row.email}</p>}
+                                  {/* Quick Present / Absent buttons directly against attendee name */}
+                                  <div className="flex items-center space-x-1 pt-0.5">
+                                    <button
+                                      type="button"
+                                      onClick={() => handleToggleSyncedRowAttendance(row, 'present')}
+                                      className={cn(
+                                        "px-2 py-0.5 rounded text-[10px] font-black uppercase tracking-wider flex items-center space-x-1 transition-all cursor-pointer",
+                                        isPresent
+                                          ? "bg-emerald-600 text-white shadow-xs"
+                                          : "bg-gray-100 text-gray-500 hover:bg-emerald-50 hover:text-emerald-700"
+                                      )}
+                                      title={isPresent ? "Currently marked Present" : "Click to mark Present & credit"}
+                                    >
+                                      <CheckCircle2 size={10} />
+                                      <span>Present</span>
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => handleToggleSyncedRowAttendance(row, 'reversed_absent')}
+                                      className={cn(
+                                        "px-2 py-0.5 rounded text-[10px] font-black uppercase tracking-wider flex items-center space-x-1 transition-all cursor-pointer",
+                                        !isPresent
+                                          ? "bg-rose-600 text-white shadow-xs"
+                                          : "bg-gray-100 text-gray-500 hover:bg-rose-50 hover:text-rose-700"
+                                      )}
+                                      title={!isPresent ? "Currently marked Absent" : "Click to mark Absent & reverse credit"}
+                                    >
+                                      <XCircle size={10} />
+                                      <span>Absent</span>
+                                    </button>
+                                  </div>
+                                </div>
+                              </div>
+                            </td>
+
+                            {/* One-Click Action: Present & Absent Buttons (Column 2, right beside name) */}
+                            <td className="p-4 min-w-[210px] text-center">
+                              <div className="inline-flex items-center p-1 bg-gray-100 rounded-xl space-x-1 border border-gray-200">
+                                <button
+                                  type="button"
+                                  onClick={() => handleToggleSyncedRowAttendance(row, 'present')}
+                                  className={cn(
+                                    "px-2.5 py-1.5 rounded-lg text-xs font-black uppercase tracking-wider flex items-center space-x-1 transition-all cursor-pointer",
+                                    isPresent
+                                      ? "bg-emerald-600 text-white shadow-xs ring-1 ring-emerald-500"
+                                      : "bg-white text-gray-500 hover:text-emerald-700 hover:bg-emerald-50 border border-transparent hover:border-emerald-200"
+                                  )}
+                                  title={isPresent ? "Currently marked Present" : "Click to mark Present & credit attendance"}
+                                >
+                                  <CheckCircle2 size={12} className={isPresent ? "text-white" : "text-emerald-600"} />
+                                  <span>Present</span>
+                                </button>
+
+                                <button
+                                  type="button"
+                                  onClick={() => handleToggleSyncedRowAttendance(row, 'reversed_absent')}
+                                  className={cn(
+                                    "px-2.5 py-1.5 rounded-lg text-xs font-black uppercase tracking-wider flex items-center space-x-1 transition-all cursor-pointer",
+                                    !isPresent
+                                      ? "bg-rose-600 text-white shadow-xs ring-1 ring-rose-500"
+                                      : "bg-white text-gray-500 hover:text-rose-700 hover:bg-rose-50 border border-transparent hover:border-rose-200"
+                                  )}
+                                  title={!isPresent ? "Currently marked Absent" : "Click to mark Absent & reverse credit error"}
+                                >
+                                  <XCircle size={12} className={!isPresent ? "text-white" : "text-rose-600"} />
+                                  <span>Absent</span>
+                                </button>
+                              </div>
+                            </td>
+
+                            {/* Status */}
+                            <td className="p-4 min-w-[150px]">
+                              {isPresent ? (
+                                <span className="inline-flex items-center space-x-1 px-3 py-1 bg-emerald-100 text-emerald-800 text-[11px] font-black rounded-full border border-emerald-300">
+                                  <CheckCircle2 size={13} className="text-emerald-600 shrink-0" />
+                                  <span>CREDITED (PRESENT)</span>
+                                </span>
+                              ) : (
+                                <span className="inline-flex items-center space-x-1 px-3 py-1 bg-rose-100 text-rose-800 text-[11px] font-black rounded-full border border-rose-300">
+                                  <X size={13} className="text-rose-600 shrink-0" />
+                                  <span>REVERSED (ABSENT)</span>
+                                </span>
+                              )}
+                            </td>
+
+                            {/* Member Account */}
+                            <td className="p-4 min-w-[180px]">
+                              {row.matchedMember ? (
+                                <div>
+                                  <span className="font-bold text-[#1A1F3C] block">{row.matchedMember.displayName || row.matchedMember.email}</span>
+                                  {row.matchedMember.phone && <span className="text-[10px] text-gray-400 font-mono block">{row.matchedMember.phone}</span>}
+                                </div>
+                              ) : (
+                                <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-purple-100 text-purple-800">
+                                  Guest Visitor
+                                </span>
+                              )}
+                            </td>
+
+                            {/* Community */}
+                            <td className="p-4 min-w-[160px]">
+                              <span className="text-[11px] font-bold text-gray-600">
+                                {row.whatsappCommunity || 'Unassigned'}
+                              </span>
+                            </td>
+
+                            {/* Duration & Edit */}
+                            <td className="p-4 text-center min-w-[140px]">
+                              {isEditingMins ? (
+                                <div className="flex items-center justify-center space-x-1">
+                                  <input
+                                    type="number"
+                                    min="1"
+                                    max="720"
+                                    value={editingMinutesValue}
+                                    onChange={(e) => setEditingMinutesValue(parseInt(e.target.value) || 1)}
+                                    className="w-16 px-1.5 py-1 bg-white border border-[#F26522] rounded-lg text-xs font-mono font-bold text-center"
+                                  />
+                                  <button
+                                    type="button"
+                                    onClick={() => handleAdjustSyncedRowMinutes(row, editingMinutesValue)}
+                                    className="p-1 bg-[#F26522] text-white rounded hover:bg-[#d9561a] cursor-pointer"
+                                    title="Save minutes"
+                                  >
+                                    <Check size={12} />
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => setEditingMinutesRowId(null)}
+                                    className="p-1 bg-gray-200 text-gray-600 rounded hover:bg-gray-300 cursor-pointer"
+                                  >
+                                    <X size={12} />
+                                  </button>
+                                </div>
+                              ) : (
+                                <div className="flex items-center justify-center space-x-1.5">
+                                  <span className="font-mono font-black text-sm text-[#1A1F3C]">{row.durationMinutes}m</span>
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      setEditingMinutesRowId(row.logId);
+                                      setEditingMinutesValue(row.durationMinutes);
+                                    }}
+                                    className="p-1 text-gray-400 hover:text-[#F26522] hover:bg-orange-50 rounded transition-colors cursor-pointer"
+                                    title="Edit prayer duration"
+                                  >
+                                    <Edit3 size={12} />
+                                  </button>
+                                </div>
+                              )}
+                            </td>
+
+                            {/* Reassign Member Button */}
+                            <td className="p-4 text-right min-w-[110px]">
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setReassigningLogId(row.logId);
+                                  setReassigningSearch(row.name);
+                                }}
+                                className="px-2.5 py-1.5 bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-xl text-xs font-bold transition-all flex items-center space-x-1 cursor-pointer ml-auto"
+                                title="Reassign this attendance log to a different registered member"
+                              >
+                                <UserCheck size={12} className="text-[#F26522]" />
+                                <span>Reassign</span>
+                              </button>
+                            </td>
+                          </tr>
+                        );
+                      })}
                   </tbody>
                 </table>
               </div>
@@ -1903,20 +2740,30 @@ export default function ZoomAttendanceSync({ members, onRefreshMembers }: ZoomAt
                   </button>
                 </div>
 
-                <div className="flex items-center justify-between shrink-0">
+                <div className="flex flex-wrap items-center justify-between gap-2 shrink-0">
                   <p className="text-xs font-bold text-gray-500">
                     Showing {sessionLogs.length} participant logs ({selectedSession.totalMinutes} total minutes)
                   </p>
-                  <button
-                    onClick={() => handleExportSessionLogsCSV(selectedSession, sessionLogs)}
-                    className="flex items-center space-x-1.5 px-3 py-1.5 bg-[#1A1F3C] hover:bg-[#F26522] text-white rounded-xl text-xs font-bold transition-all cursor-pointer"
-                  >
-                    <Download size={12} />
-                    <span>Export CSV</span>
-                  </button>
+                  <div className="flex items-center space-x-2">
+                    <button
+                      type="button"
+                      onClick={() => setShowAddMemberToSessionModal(true)}
+                      className="flex items-center space-x-1.5 px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-bold transition-all cursor-pointer shadow-xs"
+                    >
+                      <Plus size={13} />
+                      <span>Add Missed Member</span>
+                    </button>
+                    <button
+                      onClick={() => handleExportSessionLogsCSV(selectedSession, sessionLogs)}
+                      className="flex items-center space-x-1.5 px-3 py-1.5 bg-[#1A1F3C] hover:bg-[#F26522] text-white rounded-xl text-xs font-bold transition-all cursor-pointer"
+                    >
+                      <Download size={12} />
+                      <span>Export CSV</span>
+                    </button>
+                  </div>
                 </div>
 
-                <div className="overflow-y-auto flex-grow">
+                <div className="overflow-y-auto max-h-[500px] flex-grow custom-scrollbar border border-gray-100 rounded-2xl">
                   {loadingLogs ? (
                     <div className="p-12 text-center text-gray-400">
                       <RefreshCw size={24} className="animate-spin mx-auto text-[#F26522] mb-2" />
@@ -1927,41 +2774,80 @@ export default function ZoomAttendanceSync({ members, onRefreshMembers }: ZoomAt
                       <p className="text-xs">No detailed logs found for this session.</p>
                     </div>
                   ) : (
-                    <table className="w-full text-left border-collapse">
+                    <table className="w-full text-left border-collapse text-xs">
                       <thead>
-                        <tr className="bg-gray-50 border-b border-gray-100 text-[10px] font-black uppercase tracking-widest text-gray-400">
+                        <tr className="bg-gray-50 border-b border-gray-100 text-[10px] font-black uppercase tracking-widest text-gray-400 sticky top-0 bg-gray-50 z-10">
                           <th className="p-3">Attendee</th>
                           <th className="p-3">Email</th>
                           <th className="p-3">WhatsApp Community</th>
                           <th className="p-3">Status</th>
                           <th className="p-3">Time</th>
+                          <th className="p-3 text-center min-w-[190px]">Correction (Present / Absent)</th>
                         </tr>
                       </thead>
-                      <tbody className="divide-y divide-gray-100 text-xs">
-                        {sessionLogs.map(log => (
-                          <tr key={log.id} className="hover:bg-gray-50">
-                            <td className="p-3 font-bold text-[#1A1F3C]">{log.name}</td>
-                            <td className="p-3 font-mono text-gray-500">{log.email || '—'}</td>
-                            <td className="p-3">
-                              {log.whatsappCommunity ? (
-                                <span className="inline-flex items-center space-x-1 text-[10px] font-bold text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded-full border border-emerald-200">
-                                  <MessageCircle size={10} className="shrink-0" />
-                                  <span>{log.whatsappCommunity}</span>
-                                </span>
-                              ) : (
-                                <span className="text-gray-400 text-[10px] italic">Unassigned</span>
-                              )}
-                            </td>
-                            <td className="p-3">
-                              {log.isMember ? (
-                                <span className="text-[10px] font-black text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded-full">Member</span>
-                              ) : (
-                                <span className="text-[10px] font-black text-purple-700 bg-purple-50 px-2 py-0.5 rounded-full">Guest</span>
-                              )}
-                            </td>
-                            <td className="p-3 font-mono font-bold text-[#F26522]">{log.durationMinutes} mins</td>
-                          </tr>
-                        ))}
+                      <tbody className="divide-y divide-gray-100">
+                        {sessionLogs.map(log => {
+                          const isReversed = log.status === 'reversed_absent';
+                          return (
+                            <tr key={log.id} className={cn("hover:bg-gray-50", isReversed && "bg-rose-50/30")}>
+                              <td className="p-3 font-bold text-[#1A1F3C]">{log.name}</td>
+                              <td className="p-3 font-mono text-gray-500">{log.email || '—'}</td>
+                              <td className="p-3">
+                                {log.whatsappCommunity ? (
+                                  <span className="inline-flex items-center space-x-1 text-[10px] font-bold text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded-full border border-emerald-200">
+                                    <MessageCircle size={10} className="shrink-0" />
+                                    <span>{log.whatsappCommunity}</span>
+                                  </span>
+                                ) : (
+                                  <span className="text-gray-400 text-[10px] italic">Unassigned</span>
+                                )}
+                              </td>
+                              <td className="p-3">
+                                {isReversed ? (
+                                  <span className="text-[10px] font-black text-rose-700 bg-rose-100 px-2 py-0.5 rounded-full">Reversed (Absent)</span>
+                                ) : log.isMember ? (
+                                  <span className="text-[10px] font-black text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded-full">Member</span>
+                                ) : (
+                                  <span className="text-[10px] font-black text-purple-700 bg-purple-50 px-2 py-0.5 rounded-full">Guest</span>
+                                )}
+                              </td>
+                              <td className="p-3 font-mono font-bold text-[#F26522]">{log.durationMinutes} mins</td>
+                              <td className="p-3 text-center min-w-[190px]">
+                                <div className="inline-flex items-center p-1 bg-gray-100 rounded-xl space-x-1 border border-gray-200">
+                                  <button
+                                    type="button"
+                                    onClick={() => handleTogglePastSessionLog(log, 'present')}
+                                    className={cn(
+                                      "px-2.5 py-1 rounded-lg text-xs font-black uppercase tracking-wider flex items-center space-x-1 transition-all cursor-pointer",
+                                      !isReversed
+                                        ? "bg-emerald-600 text-white shadow-xs ring-1 ring-emerald-500"
+                                        : "bg-white text-gray-500 hover:text-emerald-700 hover:bg-emerald-50 border border-transparent hover:border-emerald-200"
+                                    )}
+                                    title={!isReversed ? "Currently marked Present" : "Click to mark Present & restore credit"}
+                                  >
+                                    <CheckCircle2 size={12} className={!isReversed ? "text-white" : "text-emerald-600"} />
+                                    <span>Present</span>
+                                  </button>
+
+                                  <button
+                                    type="button"
+                                    onClick={() => handleTogglePastSessionLog(log, 'reversed_absent')}
+                                    className={cn(
+                                      "px-2.5 py-1 rounded-lg text-xs font-black uppercase tracking-wider flex items-center space-x-1 transition-all cursor-pointer",
+                                      isReversed
+                                        ? "bg-rose-600 text-white shadow-xs ring-1 ring-rose-500"
+                                        : "bg-white text-gray-500 hover:text-rose-700 hover:bg-rose-50 border border-transparent hover:border-rose-200"
+                                    )}
+                                    title={isReversed ? "Currently marked Absent" : "Click to mark Absent & reverse credit error"}
+                                  >
+                                    <XCircle size={12} className={isReversed ? "text-white" : "text-rose-600"} />
+                                    <span>Absent</span>
+                                  </button>
+                                </div>
+                              </td>
+                            </tr>
+                          );
+                        })}
                       </tbody>
                     </table>
                   )}
@@ -1969,6 +2855,236 @@ export default function ZoomAttendanceSync({ members, onRefreshMembers }: ZoomAt
               </div>
             </div>
           )}
+        </div>
+      )}
+
+      {/* ========================================================================= */}
+      {/* MODAL 1: SEARCHABLE REGISTERED MEMBER PICKER (PRE-SYNC & POST-SYNC)      */}
+      {/* ========================================================================= */}
+      {(matchingPickerRowId || reassigningLogId) && (
+        <div 
+          onClick={() => {
+            setMatchingPickerRowId(null);
+            setReassigningLogId(null);
+          }}
+          className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4 animate-in fade-in"
+        >
+          <div 
+            onClick={(e) => e.stopPropagation()}
+            className="bg-white rounded-3xl p-6 sm:p-7 max-w-lg w-full space-y-5 shadow-2xl border border-gray-100"
+          >
+            <div className="flex items-center justify-between border-b border-gray-100 pb-3">
+              <div>
+                <h4 className="font-black text-[#1A1F3C] text-base flex items-center space-x-2">
+                  <UserCheck size={18} className="text-[#F26522]" />
+                  <span>Assign Registered Member</span>
+                </h4>
+                <p className="text-gray-400 text-xs">
+                  {reassigningLogId 
+                    ? "Reassign this synchronized attendance credit to the correct church member."
+                    : "Match this Zoom participant to their registered church member profile."}
+                </p>
+              </div>
+              <button 
+                onClick={() => {
+                  setMatchingPickerRowId(null);
+                  setReassigningLogId(null);
+                }}
+                className="p-1.5 text-gray-400 hover:text-gray-700 rounded-full cursor-pointer"
+              >
+                <X size={18} />
+              </button>
+            </div>
+
+            {/* Search Input */}
+            <div className="relative">
+              <Search size={15} className="absolute left-3.5 top-1/2 -translate-y-1/2 text-gray-400" />
+              <input
+                type="text"
+                autoFocus
+                placeholder="Search by name, phone, or email..."
+                value={reassigningLogId ? reassigningSearch : matchingPickerSearch}
+                onChange={(e) => {
+                  if (reassigningLogId) {
+                    setReassigningSearch(e.target.value);
+                  } else {
+                    setMatchingPickerSearch(e.target.value);
+                  }
+                }}
+                className="w-full pl-9 pr-4 py-2.5 bg-gray-50 border border-gray-200 focus:border-[#F26522] rounded-xl text-xs font-bold outline-none"
+              />
+            </div>
+
+            {/* Unlink to Guest button (if pre-sync) */}
+            {matchingPickerRowId && (
+              <div className="flex justify-end">
+                <button
+                  type="button"
+                  onClick={() => handleUnlinkRowToGuest(matchingPickerRowId)}
+                  className="text-[11px] font-bold text-purple-700 hover:underline cursor-pointer"
+                >
+                  Unlink member (Treat as Non-Registered Guest)
+                </button>
+              </div>
+            )}
+
+            {/* Members List */}
+            <div className="max-h-64 overflow-y-auto divide-y divide-gray-100 border border-gray-100 rounded-2xl custom-scrollbar">
+              {members
+                .filter(m => {
+                  const q = (reassigningLogId ? reassigningSearch : matchingPickerSearch).toLowerCase().trim();
+                  if (!q) return true;
+                  return (
+                    (m.displayName || '').toLowerCase().includes(q) ||
+                    (m.email || '').toLowerCase().includes(q) ||
+                    (m.phone || '').toLowerCase().includes(q)
+                  );
+                })
+                .slice(0, 30)
+                .map(m => (
+                  <div
+                    key={m.uid}
+                    onClick={() => {
+                      if (matchingPickerRowId) {
+                        handleAssignRowMember(matchingPickerRowId, m);
+                      } else if (reassigningLogId && syncedSessionCorrection) {
+                        const targetRow = syncedSessionCorrection.rows.find(r => r.logId === reassigningLogId);
+                        if (targetRow) {
+                          handleReassignSyncedRowMember(targetRow, m);
+                        }
+                      }
+                    }}
+                    className="p-3 hover:bg-orange-50/40 flex items-center justify-between text-xs cursor-pointer transition-colors"
+                  >
+                    <div className="min-w-0 pr-2">
+                      <p className="font-bold text-[#1A1F3C] truncate">{m.displayName || m.email}</p>
+                      <p className="text-[10px] text-gray-400 font-mono truncate">{m.email || m.phone || 'No contact'}</p>
+                    </div>
+                    <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-gray-100 text-gray-700 shrink-0">
+                      {getMemberWhatsAppCommunity(m)}
+                    </span>
+                  </div>
+                ))}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ========================================================================= */}
+      {/* MODAL 2: ADD MISSED MEMBER TO PAST SESSION                               */}
+      {/* ========================================================================= */}
+      {showAddMemberToSessionModal && selectedSession && (
+        <div 
+          onClick={() => setShowAddMemberToSessionModal(false)}
+          className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4 animate-in fade-in"
+        >
+          <div 
+            onClick={(e) => e.stopPropagation()}
+            className="bg-white rounded-3xl p-6 sm:p-7 max-w-md w-full space-y-5 shadow-2xl border border-gray-100"
+          >
+            <div className="flex items-center justify-between border-b border-gray-100 pb-3">
+              <div>
+                <h4 className="font-black text-[#1A1F3C] text-base flex items-center space-x-2">
+                  <Plus size={18} className="text-[#F26522]" />
+                  <span>Credit Missed Member to Session</span>
+                </h4>
+                <p className="text-gray-400 text-xs">
+                  For: {selectedSession.title} ({selectedSession.meetingDate})
+                </p>
+              </div>
+              <button 
+                onClick={() => setShowAddMemberToSessionModal(false)}
+                className="p-1.5 text-gray-400 hover:text-gray-700 rounded-full cursor-pointer"
+              >
+                <X size={18} />
+              </button>
+            </div>
+
+            {/* Search Member */}
+            <div className="space-y-2">
+              <label className="text-[10px] font-black uppercase tracking-wider text-gray-400 block">
+                Select Church Member
+              </label>
+              <div className="relative">
+                <Search size={15} className="absolute left-3.5 top-1/2 -translate-y-1/2 text-gray-400" />
+                <input
+                  type="text"
+                  placeholder="Search member..."
+                  value={addMemberSessionSearch}
+                  onChange={(e) => setAddMemberSessionSearch(e.target.value)}
+                  className="w-full pl-9 pr-4 py-2.5 bg-gray-50 border border-gray-200 focus:border-[#F26522] rounded-xl text-xs font-bold outline-none"
+                />
+              </div>
+
+              <div className="max-h-40 overflow-y-auto divide-y divide-gray-100 border border-gray-100 rounded-xl custom-scrollbar">
+                {members
+                  .filter(m => {
+                    const q = addMemberSessionSearch.toLowerCase().trim();
+                    if (!q) return true;
+                    return (
+                      (m.displayName || '').toLowerCase().includes(q) ||
+                      (m.email || '').toLowerCase().includes(q) ||
+                      (m.phone || '').toLowerCase().includes(q)
+                    );
+                  })
+                  .slice(0, 15)
+                  .map(m => (
+                    <div
+                      key={m.uid}
+                      onClick={() => setAddMemberSessionMemberId(m.uid)}
+                      className={cn(
+                        "p-2.5 flex items-center justify-between text-xs cursor-pointer transition-colors",
+                        addMemberSessionMemberId === m.uid ? "bg-orange-100/70 border-l-4 border-[#F26522]" : "hover:bg-gray-50"
+                      )}
+                    >
+                      <span className="font-bold text-[#1A1F3C] truncate">{m.displayName || m.email}</span>
+                      <span className="text-[10px] text-gray-400">{getMemberWhatsAppCommunity(m)}</span>
+                    </div>
+                  ))}
+              </div>
+            </div>
+
+            {/* Duration */}
+            <div className="space-y-1.5">
+              <label className="text-[10px] font-black uppercase tracking-wider text-gray-400 block">
+                Prayer Duration (Minutes)
+              </label>
+              <div className="grid grid-cols-4 gap-2">
+                {[30, 60, 90, 120].map(mins => (
+                  <button
+                    key={mins}
+                    type="button"
+                    onClick={() => setAddMemberSessionMinutes(mins)}
+                    className={cn(
+                      "py-2 rounded-xl text-xs font-bold cursor-pointer transition-all",
+                      addMemberSessionMinutes === mins ? "bg-[#1A1F3C] text-white" : "bg-gray-100 text-gray-600 hover:bg-gray-200"
+                    )}
+                  >
+                    {mins}m
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div className="pt-2 flex justify-end space-x-2">
+              <button
+                type="button"
+                onClick={() => setShowAddMemberToSessionModal(false)}
+                className="px-4 py-2 bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-xl text-xs font-bold cursor-pointer"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={handleAddMissedMemberToSession}
+                disabled={addingMemberToSession || !addMemberSessionMemberId}
+                className="px-5 py-2 bg-[#F26522] hover:bg-[#d9561a] disabled:opacity-50 text-white rounded-xl text-xs font-black uppercase tracking-wider transition-all cursor-pointer flex items-center space-x-1.5"
+              >
+                {addingMemberToSession ? <RefreshCw size={13} className="animate-spin" /> : <Check size={13} />}
+                <span>Credit Attendance</span>
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </div>

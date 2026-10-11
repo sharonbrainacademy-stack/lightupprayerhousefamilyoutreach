@@ -1,5 +1,31 @@
 @import "tailwindcss";
 
+/* Stable, user-friendly custom scrollbar across all browsers */
+.custom-scrollbar {
+  scrollbar-width: thin;
+  scrollbar-color: #cbd5e1 #f8fafc;
+}
+
+.custom-scrollbar::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+.custom-scrollbar::-webkit-scrollbar-track {
+  background: #f1f5f9;
+  border-radius: 8px;
+}
+
+.custom-scrollbar::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 8px;
+  border: 2px solid #f1f5f9;
+}
+
+.custom-scrollbar::-webkit-scrollbar-thumb:hover {
+  background: #F26522;
+}
+
 /* Hide Netlify feedback drawer or badges if injected in preview builds */
 #netlify-drawer,
 .netlify-feedback-button,

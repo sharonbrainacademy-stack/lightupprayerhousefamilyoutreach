@@ -14,9 +14,9 @@ import {
   MessageCircle, Share2, Copy, Link as LinkIcon, ExternalLink, Save,
   Smartphone, Wifi, Send, Zap, Image as ImageIcon, Upload, Palette, Sparkles,
   UserPlus, FileSpreadsheet, HandHeart, Eye, EyeOff, ImagePlus,
-  Key, Lock
+  Key, Lock, ClipboardCheck, UserCheck, HeartHandshake, XCircle
 } from 'lucide-react';
-import { collection, onSnapshot, doc, updateDoc, setDoc, addDoc, deleteDoc, serverTimestamp, getDocs, writeBatch } from 'firebase/firestore';
+import { collection, onSnapshot, doc, updateDoc, setDoc, addDoc, deleteDoc, serverTimestamp, getDocs, writeBatch, arrayUnion, arrayRemove, increment } from 'firebase/firestore';
 import { useAuth, SUPER_ADMIN_EMAILS } from '../lib/auth';
 import { useSiteBranding, updateSiteBranding } from '../lib/settings';
 import { db } from '../lib/firebase';
@@ -39,10 +39,13 @@ import {
 import { useZoomSession } from '../lib/ZoomContext';
 import { motion, AnimatePresence } from 'motion/react';
 import ZoomAttendanceSync from '../components/ZoomAttendanceSync';
+import DailyAttendanceReport from '../components/admin/DailyAttendanceReport';
+import ManualAttendanceModal from '../components/admin/ManualAttendanceModal';
 import FlyerModal, { FlyerModalData } from '../components/FlyerModal';
 import AdminOutreachTab from '../components/admin/AdminOutreachTab';
 import AdminStaffManagementTab from '../components/admin/AdminStaffManagementTab';
 import AdminBooksTab from '../components/admin/AdminBooksTab';
+import EstherGroupModal from '../components/admin/EstherGroupModal';
 import { 
   SermonItem, 
   DEFAULT_SERMONS, 
@@ -73,7 +76,7 @@ import {
   isImageDataUrlSafeForFirestore 
 } from '../lib/image-utils';
 
-type AdminTab = 'overview' | 'members' | 'zoom-sync' | 'guests' | 'whatsapp' | 'themes' | 'programs' | 'books' | 'media' | 'outreach' | 'moderation' | 'admins' | 'branding';
+type AdminTab = 'overview' | 'members' | 'attendance-reports' | 'zoom-sync' | 'guests' | 'whatsapp' | 'themes' | 'programs' | 'books' | 'media' | 'outreach' | 'moderation' | 'admins' | 'branding';
 
 interface GuestAttendanceRecord {
   id: string;
@@ -144,6 +147,8 @@ export default function AdminDashboard() {
   const { profile, login, loginWithPasscode, user, logout, authError, isLoggingIn, clearAuthError } = useAuth();
   const { isGlobalMeetingLive, activeParticipantsCount, endGlobalLiveMeeting, startGlobalLiveMeeting } = useZoomSession();
   const [activeTab, setActiveTab] = useState<AdminTab>('members');
+  const [attendanceReportTargetDate, setAttendanceReportTargetDate] = useState<string | undefined>(undefined);
+  const [attendanceReportInitialSubTab, setAttendanceReportInitialSubTab] = useState<'reports' | 'followup'>('reports');
   const [loginMode, setLoginMode] = useState<'passcode' | 'google'>('passcode');
   const [passcodeEmail, setPasscodeEmail] = useState('');
   const [adminPasscode, setAdminPasscode] = useState('');
@@ -164,9 +169,13 @@ export default function AdminDashboard() {
   const [communityFilter, setCommunityFilter] = useState<string>('all');
   const [activatingAdmin, setActivatingAdmin] = useState(false);
   const [showLiveRosterModal, setShowLiveRosterModal] = useState(false);
+  const [showEstherGroupModal, setShowEstherGroupModal] = useState(false);
+  const [showManualAttendanceModal, setShowManualAttendanceModal] = useState(false);
+  const [manualAttendanceSelectedMember, setManualAttendanceSelectedMember] = useState<UserProfile | null>(null);
   const [liveTick, setLiveTick] = useState(Date.now());
   const [memberFeedback, setMemberFeedback] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
   const [selectedMemberUids, setSelectedMemberUids] = useState<string[]>([]);
+  const [togglingMemberUid, setTogglingMemberUid] = useState<string | null>(null);
   const [deletingMemberUid, setDeletingMemberUid] = useState<string | null>(null);
   const [memberToDelete, setMemberToDelete] = useState<UserProfile | null>(null);
   const [showBulkDeleteModal, setShowBulkDeleteModal] = useState(false);
@@ -1729,6 +1738,58 @@ export default function AdminDashboard() {
     }
   };
 
+  // Inline direct Present / Absent attendance correction for a member
+  const handleInlineToggleAttendance = async (targetMember: UserProfile, targetStatus: 'present' | 'absent') => {
+    if (!targetMember.uid) return;
+    const todayDateStr = getTodayDateString();
+    setTogglingMemberUid(targetMember.uid);
+    try {
+      const userRef = doc(db, 'users', targetMember.uid);
+      const currentDays = Array.isArray(targetMember.attendanceDaysList) ? [...targetMember.attendanceDaysList] : [];
+      const currentDailyMap = targetMember.dailyMinutes ? { ...targetMember.dailyMinutes } : {};
+
+      if (targetStatus === 'absent') {
+        delete currentDailyMap[todayDateStr];
+        await updateDoc(userRef, {
+          attendanceDaysList: arrayRemove(todayDateStr),
+          attendanceCount: Math.max(0, (targetMember.attendanceCount || currentDays.length) - 1),
+          totalMinutes: Math.max(0, (targetMember.totalMinutes || 0) - (currentDailyMap[todayDateStr] || 60)),
+          dailyMinutes: currentDailyMap,
+          todayMinutes: 0,
+          manualAdjustmentNote: `Marked absent on ${new Date().toLocaleDateString()}`
+        });
+        setMemberFeedback({
+          type: 'success',
+          message: `Marked ${targetMember.displayName || 'Member'} as ABSENT for today (${todayDateStr}).`
+        });
+      } else {
+        const isNewDay = !currentDays.includes(todayDateStr);
+        currentDailyMap[todayDateStr] = 60;
+        await updateDoc(userRef, {
+          attendanceDaysList: arrayUnion(todayDateStr),
+          lastAttendedDate: todayDateStr,
+          attendanceCount: increment(isNewDay ? 1 : 0),
+          totalMinutes: (targetMember.totalMinutes || 0) + 60,
+          dailyMinutes: currentDailyMap,
+          todayMinutes: 60,
+          manualAdjustmentNote: `Marked present on ${new Date().toLocaleDateString()}`
+        });
+        setMemberFeedback({
+          type: 'success',
+          message: `Marked ${targetMember.displayName || 'Member'} as PRESENT for today (${todayDateStr}).`
+        });
+      }
+    } catch (err: any) {
+      console.error('Failed to toggle attendance:', err);
+      setMemberFeedback({
+        type: 'error',
+        message: err?.message || 'Failed to update attendance status.'
+      });
+    } finally {
+      setTogglingMemberUid(null);
+    }
+  };
+
   // Moderation action
   const handleUpdateTestimonyStatus = async (id: string, status: 'approved' | 'declined') => {
     try {
@@ -2040,7 +2101,8 @@ export default function AdminDashboard() {
 
   const menuItems = [
     { id: 'members', name: 'Members & Attendance', icon: Users },
-    { id: 'zoom-sync', name: 'Zoom CSV Sync & Import', icon: FileSpreadsheet },
+    { id: 'attendance-reports', name: 'Attendance Hub & Roster', icon: ClipboardCheck },
+    { id: 'zoom-sync', name: 'Zoom CSV Auto-Sync', icon: FileSpreadsheet },
     { id: 'guests', name: 'Guest / Unregistered Zoom Logs', icon: Video },
     { id: 'whatsapp', name: 'WhatsApp Tracking', icon: MessageCircle },
     { id: 'branding', name: 'Logo & Branding', icon: Palette },
@@ -2434,85 +2496,54 @@ export default function AdminDashboard() {
                 </div>
                 <div className="flex flex-wrap items-center gap-3">
                   <button
+                    onClick={() => {
+                      setAttendanceReportInitialSubTab('reports');
+                      setActiveTab('attendance-reports');
+                    }}
+                    className="flex items-center justify-center space-x-2 px-5 py-3.5 bg-gradient-to-r from-[#F26522] to-amber-600 hover:from-[#d9561a] hover:to-amber-700 text-white rounded-xl font-black uppercase tracking-widest text-xs shadow-lg shadow-[#F26522]/30 transition-all cursor-pointer"
+                    title="View Daily Attendance Reports & Unified Roster"
+                  >
+                    <ClipboardCheck size={16} />
+                    <span>Daily Attendance Reports</span>
+                  </button>
+
+                  <button
+                    onClick={() => {
+                      setAttendanceReportInitialSubTab('followup');
+                      setActiveTab('attendance-reports');
+                    }}
+                    className="flex items-center justify-center space-x-2 px-5 py-3.5 bg-rose-600 hover:bg-rose-700 text-white rounded-xl font-black uppercase tracking-widest text-xs shadow-lg shadow-rose-600/30 transition-all cursor-pointer"
+                    title="Follow up all absent members with one-click WhatsApp, call, or email"
+                  >
+                    <HeartHandshake size={16} />
+                    <span>Absent Follow-Up Hub</span>
+                  </button>
+
+                  <button
+                    onClick={() => setShowEstherGroupModal(true)}
+                    className="flex items-center justify-center space-x-2 px-5 py-3.5 bg-gradient-to-r from-purple-800 to-indigo-900 hover:from-purple-900 hover:to-indigo-950 text-white rounded-xl font-black uppercase tracking-widest text-xs shadow-lg shadow-purple-900/30 transition-all cursor-pointer border border-purple-400/30"
+                    title="View & manage 122 registered Esther Group members"
+                  >
+                    <Users size={16} className="text-amber-300" />
+                    <span>Esther Group (122)</span>
+                  </button>
+
+                  <button
                     onClick={() => setActiveTab('zoom-sync')}
                     className="flex items-center justify-center space-x-2 px-5 py-3.5 bg-[#1A1F3C] hover:bg-[#282E5C] text-white rounded-xl font-black uppercase tracking-widest text-xs shadow-lg transition-all cursor-pointer"
                   >
-                    <Upload size={15} className="text-[#F26522]" />
+                    <Upload size={16} className="text-[#F26522]" />
                     <span>Import Zoom CSV</span>
                   </button>
-                  <button
-                    onClick={() => setShowLiveRosterModal(true)}
-                    className="flex items-center justify-center space-x-2 px-5 py-3.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl font-black uppercase tracking-widest text-xs shadow-lg shadow-emerald-600/20 transition-all cursor-pointer"
-                  >
-                    <span className="w-2.5 h-2.5 rounded-full bg-white animate-pulse"></span>
-                    <span>Live Zoom Room ({totalLiveInZoomCount})</span>
-                  </button>
+
                   <button 
                     onClick={handleExportCSV}
                     disabled={filteredMembers.length === 0}
-                    className="flex items-center justify-center space-x-2 px-6 py-3.5 bg-[#F26522] text-white rounded-xl font-black uppercase tracking-widest text-xs hover:bg-[#d9561a] shadow-lg shadow-[#F26522]/20 transition-all disabled:opacity-50"
+                    className="flex items-center justify-center space-x-2 px-6 py-3.5 bg-[#F26522] text-white rounded-xl font-black uppercase tracking-widest text-xs hover:bg-[#d9561a] shadow-lg shadow-[#F26522]/20 transition-all disabled:opacity-50 cursor-pointer"
                   >
                     <Download size={16} />
                     <span>Download Attendance CSV</span>
                   </button>
-                </div>
-              </div>
-
-              {/* Automatic Live Zoom Status Banner & Admin Controls */}
-              <div className="bg-[#1A1F3C] text-white p-6 rounded-3xl shadow-xl flex flex-col md:flex-row items-center justify-between gap-6 border border-white/10">
-                <div className="flex items-center space-x-4">
-                  <div className={cn(
-                    "w-14 h-14 rounded-2xl flex items-center justify-center shrink-0 font-black text-xl shadow-inner",
-                    totalLiveInZoomCount > 0 || isGlobalMeetingLive ? "bg-emerald-500/20 text-emerald-400 border border-emerald-500/30" : "bg-gray-800 text-gray-400 border border-gray-700"
-                  )}>
-                    {totalLiveInZoomCount > 0 || isGlobalMeetingLive ? <Flame className="animate-pulse text-emerald-400" size={28} /> : <Video size={28} />}
-                  </div>
-                  <div>
-                    <div className="flex flex-wrap items-center gap-3">
-                      <h4 className="text-lg font-black text-white">Live Zoom Prayer Room Monitor</h4>
-                      {totalLiveInZoomCount > 0 || isGlobalMeetingLive ? (
-                        <span className="px-3 py-1 bg-emerald-500/20 text-emerald-400 text-[10px] font-black uppercase tracking-wider rounded-full border border-emerald-500/40 flex items-center space-x-1.5 animate-pulse">
-                          <span className="w-2 h-2 rounded-full bg-emerald-400"></span>
-                          <span>{totalLiveInZoomCount} ATTENDING NOW ({liveMembersList.length} Members, {liveGuestsList.length} Visitors)</span>
-                        </span>
-                      ) : (
-                        <span className="px-3 py-1 bg-gray-800 text-gray-400 text-[10px] font-black uppercase tracking-wider rounded-full border border-gray-700">
-                          NO ACTIVE ZOOM PARTICIPANTS
-                        </span>
-                      )}
-                    </div>
-                    <p className="text-xs text-gray-300 font-medium mt-1">
-                      Real-time live counting updates dynamically as members and visitors join or leave the Zoom prayer meeting.
-                    </p>
-                  </div>
-                </div>
-
-                <div className="flex flex-wrap items-center gap-3 w-full md:w-auto shrink-0">
-                  <button
-                    onClick={() => setShowLiveRosterModal(true)}
-                    className="w-full sm:w-auto px-5 py-3 bg-emerald-500 hover:bg-emerald-600 text-white text-xs font-black uppercase tracking-wider rounded-xl transition-all shadow-lg shadow-emerald-500/30 flex items-center justify-center space-x-2 cursor-pointer"
-                  >
-                    <Users size={16} />
-                    <span>View Live Roster ({totalLiveInZoomCount})</span>
-                  </button>
-
-                  {isGlobalMeetingLive ? (
-                    <button
-                      onClick={endGlobalLiveMeeting}
-                      className="w-full sm:w-auto px-5 py-3 bg-red-600 hover:bg-red-700 text-white text-xs font-black uppercase tracking-wider rounded-xl transition-all shadow-lg shadow-red-600/30 flex items-center justify-center space-x-2 cursor-pointer"
-                    >
-                      <X size={16} />
-                      <span>End Live Meeting</span>
-                    </button>
-                  ) : (
-                    <button
-                      onClick={startGlobalLiveMeeting}
-                      className="w-full sm:w-auto px-5 py-3 bg-[#F26522] hover:bg-[#d9561a] text-white text-xs font-black uppercase tracking-wider rounded-xl transition-all shadow-lg shadow-[#F26522]/30 flex items-center justify-center space-x-2 cursor-pointer"
-                    >
-                      <Play size={16} />
-                      <span>Start Broadcast Banner</span>
-                    </button>
-                  )}
                 </div>
               </div>
 
@@ -2745,7 +2776,7 @@ export default function AdminDashboard() {
                           <th className="p-5">Minutes This Year</th>
                           <th className="p-5">Total Prayer Time</th>
                           <th className="p-5">Location</th>
-                          <th className="p-5 text-right">Actions</th>
+                          <th className="p-5 text-right min-w-[240px]">Attendance & Actions</th>
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-gray-100 text-sm">
@@ -2763,6 +2794,10 @@ export default function AdminDashboard() {
                           const isSelf = user?.uid === m.uid;
                           const isSelected = selectedMemberUids.includes(m.uid);
                           const canDelete = !isProtected && !isSelf && (isSuperAdmin || m.role === 'member');
+                          const isPresentToday = Boolean(
+                            (Array.isArray(m.attendanceDaysList) && m.attendanceDaysList.includes(todayDateStr)) ||
+                            (m.lastAttendedDate === todayDateStr && (todayMins > 0 || (m.todayMinutes || 0) > 0))
+                          );
 
                           return (
                             <tr key={m.uid} className={cn("transition-colors", isSelected ? "bg-orange-50/40" : (isLiveNow ? "bg-emerald-50/40 hover:bg-emerald-50/70" : "hover:bg-gray-50/50"))}>
@@ -2902,31 +2937,68 @@ export default function AdminDashboard() {
                                 {m.country || 'International'}
                               </td>
                               <td className="p-5 text-right">
-                                <button
-                                  onClick={() => setMemberToDelete(m)}
-                                  disabled={!canDelete || deletingMemberUid === m.uid}
-                                  className={cn(
-                                    "p-2.5 rounded-xl transition-all inline-flex items-center justify-center",
-                                    canDelete
-                                      ? "text-red-600 bg-red-50 hover:bg-red-100 hover:scale-105 cursor-pointer shadow-sm"
-                                      : "text-gray-300 bg-gray-50 cursor-not-allowed opacity-50"
-                                  )}
-                                  title={
-                                    isProtected 
-                                      ? "Master Super Admin cannot be deleted" 
-                                      : isSelf 
-                                      ? "You cannot delete your own account" 
-                                      : !canDelete 
-                                      ? "Only Super Admins can delete admin accounts" 
-                                      : "Delete Member Account"
-                                  }
-                                >
-                                  {deletingMemberUid === m.uid ? (
-                                    <RefreshCw size={15} className="animate-spin text-red-600" />
-                                  ) : (
-                                    <Trash2 size={15} />
-                                  )}
-                                </button>
+                                <div className="flex items-center justify-end space-x-2">
+                                  {/* Quick Present / Absent Toggle Buttons Against Name */}
+                                  <div className="inline-flex items-center bg-gray-100 p-1 rounded-xl space-x-1 shrink-0">
+                                    <button
+                                      type="button"
+                                      disabled={togglingMemberUid === m.uid}
+                                      onClick={() => handleInlineToggleAttendance(m, 'present')}
+                                      className={cn(
+                                        "px-2.5 py-1.5 rounded-lg text-xs font-black uppercase tracking-wider flex items-center space-x-1 transition-all cursor-pointer",
+                                        isPresentToday
+                                          ? "bg-emerald-600 text-white shadow-sm font-black"
+                                          : "text-gray-600 hover:text-emerald-700 hover:bg-white/80"
+                                      )}
+                                      title={`Mark ${m.displayName || 'Member'} as Present for today (${todayDateStr})`}
+                                    >
+                                      <CheckCircle2 size={13} className={isPresentToday ? "text-white" : "text-emerald-600"} />
+                                      <span>Present</span>
+                                    </button>
+
+                                    <button
+                                      type="button"
+                                      disabled={togglingMemberUid === m.uid}
+                                      onClick={() => handleInlineToggleAttendance(m, 'absent')}
+                                      className={cn(
+                                        "px-2.5 py-1.5 rounded-lg text-xs font-black uppercase tracking-wider flex items-center space-x-1 transition-all cursor-pointer",
+                                        !isPresentToday
+                                          ? "bg-rose-600 text-white shadow-sm font-black"
+                                          : "text-gray-600 hover:text-rose-700 hover:bg-white/80"
+                                      )}
+                                      title={`Mark ${m.displayName || 'Member'} as Absent for today (${todayDateStr})`}
+                                    >
+                                      <XCircle size={13} className={!isPresentToday ? "text-white" : "text-rose-600"} />
+                                      <span>Absent</span>
+                                    </button>
+                                  </div>
+
+                                  <button
+                                    onClick={() => setMemberToDelete(m)}
+                                    disabled={!canDelete || deletingMemberUid === m.uid}
+                                    className={cn(
+                                      "p-2 rounded-xl transition-all inline-flex items-center justify-center",
+                                      canDelete
+                                        ? "text-red-600 bg-red-50 hover:bg-red-100 hover:scale-105 cursor-pointer shadow-sm"
+                                        : "text-gray-300 bg-gray-50 cursor-not-allowed opacity-50"
+                                    )}
+                                    title={
+                                      isProtected 
+                                        ? "Master Super Admin cannot be deleted" 
+                                        : isSelf 
+                                        ? "You cannot delete your own account" 
+                                        : !canDelete 
+                                        ? "Only Super Admins can delete admin accounts" 
+                                        : "Delete Member Account"
+                                    }
+                                  >
+                                    {deletingMemberUid === m.uid ? (
+                                      <RefreshCw size={14} className="animate-spin text-red-600" />
+                                    ) : (
+                                      <Trash2 size={14} />
+                                    )}
+                                  </button>
+                                </div>
                               </td>
                             </tr>
                           );
@@ -3065,34 +3137,26 @@ export default function AdminDashboard() {
             </div>
           )}
 
-          {/* ZOOM ATTENDANCE SYNC & CSV IMPORT TAB */}
-          {activeTab === 'zoom-sync' && (
-            <div className="space-y-8">
-              <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
-                <div>
-                  <h3 className="text-2xl font-black text-[#1A1F3C] flex items-center space-x-2">
-                    <FileSpreadsheet className="text-[#F26522]" size={28} />
-                    <span>Zoom Attendance Synchronization & CSV Import Tool</span>
-                  </h3>
-                  <p className="text-gray-500 text-sm font-medium">
-                    Automate member attendance recording by importing Zoom Participant CSV reports, matching attendee emails, and syncing prayer logs.
-                  </p>
-                </div>
-                <div className="flex items-center space-x-3">
-                  <button
-                    onClick={() => setActiveTab('members')}
-                    className="flex items-center space-x-2 px-4 py-2.5 bg-gray-100 hover:bg-gray-200 text-[#1A1F3C] rounded-xl text-xs font-bold transition-all cursor-pointer"
-                  >
-                    <Users size={15} />
-                    <span>View Members Table</span>
-                  </button>
-                </div>
-              </div>
+          {/* ATTENDANCE HUB (DAILY REPORTS & ABSENT FOLLOW-UP) */}
+          {activeTab === 'attendance-reports' && (
+            <DailyAttendanceReport 
+              members={members} 
+              onRefreshMembers={() => {}} 
+              initialSubTab={attendanceReportInitialSubTab}
+              initialDate={attendanceReportTargetDate}
+            />
+          )}
 
+          {/* ZOOM CSV IMPORT TOOL */}
+          {activeTab === 'zoom-sync' && (
+            <div className="space-y-6">
               <ZoomAttendanceSync 
                 members={members} 
-                onRefreshMembers={() => {
-                  // real-time onSnapshot handles auto refresh
+                onRefreshMembers={() => {}} 
+                onNavigateToReports={(targetDate, subTab = 'reports') => {
+                  if (targetDate) setAttendanceReportTargetDate(targetDate);
+                  setAttendanceReportInitialSubTab(subTab);
+                  setActiveTab('attendance-reports');
                 }}
               />
             </div>
@@ -3146,64 +3210,6 @@ export default function AdminDashboard() {
                     <Download size={16} />
                     <span>Download Guest CSV</span>
                   </button>
-                </div>
-              </div>
-
-              {/* Automatic Live Zoom Status Banner & Admin Controls */}
-              <div className="bg-[#1A1F3C] text-white p-6 rounded-3xl shadow-xl flex flex-col md:flex-row items-center justify-between gap-6 border border-white/10">
-                <div className="flex items-center space-x-4">
-                  <div className={cn(
-                    "w-14 h-14 rounded-2xl flex items-center justify-center shrink-0 font-black text-xl shadow-inner",
-                    totalLiveInZoomCount > 0 || isGlobalMeetingLive ? "bg-emerald-500/20 text-emerald-400 border border-emerald-500/30" : "bg-gray-800 text-gray-400 border border-gray-700"
-                  )}>
-                    {totalLiveInZoomCount > 0 || isGlobalMeetingLive ? <Flame className="animate-pulse text-emerald-400" size={28} /> : <Video size={28} />}
-                  </div>
-                  <div>
-                    <div className="flex flex-wrap items-center gap-3">
-                      <h4 className="text-lg font-black text-white">Live Zoom Prayer Room Monitor</h4>
-                      {totalLiveInZoomCount > 0 || isGlobalMeetingLive ? (
-                        <span className="px-3 py-1 bg-emerald-500/20 text-emerald-400 text-[10px] font-black uppercase tracking-wider rounded-full border border-emerald-500/40 flex items-center space-x-1.5 animate-pulse">
-                          <span className="w-2 h-2 rounded-full bg-emerald-400"></span>
-                          <span>{totalLiveInZoomCount} ATTENDING NOW ({liveGuestsList.length} Visitors, {liveMembersList.length} Members)</span>
-                        </span>
-                      ) : (
-                        <span className="px-3 py-1 bg-gray-800 text-gray-400 text-[10px] font-black uppercase tracking-wider rounded-full border border-gray-700">
-                          NO ACTIVE ZOOM PARTICIPANTS
-                        </span>
-                      )}
-                    </div>
-                    <p className="text-xs text-gray-300 font-medium mt-1">
-                      Real-time live counting of visitors and members currently logged into the Zoom prayer meeting.
-                    </p>
-                  </div>
-                </div>
-
-                <div className="flex flex-wrap items-center gap-3 w-full md:w-auto shrink-0">
-                  <button
-                    onClick={() => setShowLiveRosterModal(true)}
-                    className="w-full sm:w-auto px-5 py-3 bg-emerald-500 hover:bg-emerald-600 text-white text-xs font-black uppercase tracking-wider rounded-xl transition-all shadow-lg shadow-emerald-500/30 flex items-center justify-center space-x-2 cursor-pointer"
-                  >
-                    <Users size={16} />
-                    <span>View Live Roster ({totalLiveInZoomCount})</span>
-                  </button>
-
-                  {isGlobalMeetingLive ? (
-                    <button
-                      onClick={endGlobalLiveMeeting}
-                      className="w-full sm:w-auto px-5 py-3 bg-red-600 hover:bg-red-700 text-white text-xs font-black uppercase tracking-wider rounded-xl transition-all shadow-lg shadow-red-600/30 flex items-center justify-center space-x-2 cursor-pointer"
-                    >
-                      <X size={16} />
-                      <span>End Live Meeting</span>
-                    </button>
-                  ) : (
-                    <button
-                      onClick={startGlobalLiveMeeting}
-                      className="w-full sm:w-auto px-5 py-3 bg-[#F26522] hover:bg-[#d9561a] text-white text-xs font-black uppercase tracking-wider rounded-xl transition-all shadow-lg shadow-[#F26522]/30 flex items-center justify-center space-x-2 cursor-pointer"
-                    >
-                      <Play size={16} />
-                      <span>Start Broadcast Banner</span>
-                    </button>
-                  )}
                 </div>
               </div>
 
@@ -5848,6 +5854,33 @@ export default function AdminDashboard() {
                 </div>
               </div>
             </div>
+          )}
+
+          {showEstherGroupModal && (
+            <EstherGroupModal
+              isOpen={showEstherGroupModal}
+              onClose={() => setShowEstherGroupModal(false)}
+              members={members}
+              onFilterByEsther={() => setCommunityFilter("Esther’s Group (Benin)")}
+              onOpenAttendanceReport={() => setActiveTab('attendance-reports')}
+            />
+          )}
+
+          {showManualAttendanceModal && (
+            <ManualAttendanceModal
+              isOpen={showManualAttendanceModal}
+              onClose={() => {
+                setShowManualAttendanceModal(false);
+                setManualAttendanceSelectedMember(null);
+              }}
+              members={members}
+              initialMember={manualAttendanceSelectedMember}
+              onSuccess={(msg) => {
+                setMemberFeedback({ type: 'success', message: msg });
+                setShowManualAttendanceModal(false);
+                setManualAttendanceSelectedMember(null);
+              }}
+            />
           )}
 
         </div>
