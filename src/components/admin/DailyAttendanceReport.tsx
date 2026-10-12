@@ -1284,10 +1284,10 @@ export default function DailyAttendanceReport({
                                           onClick={() => handleToggleAttendance(row, 'present')}
                                           disabled={isUpdating}
                                           className={cn(
-                                            "px-2 py-0.5 rounded text-[10px] font-black uppercase tracking-wider flex items-center space-x-1 transition-all cursor-pointer disabled:opacity-50",
+                                            "px-2 py-0.5 rounded text-[10px] font-black uppercase tracking-wider flex items-center space-x-1 transition-all cursor-pointer disabled:opacity-50 shadow-xs",
                                             row.isPresent
-                                              ? "bg-emerald-600 text-white shadow-xs"
-                                              : "bg-gray-100 text-gray-500 hover:bg-emerald-50 hover:text-emerald-700"
+                                              ? "bg-emerald-600 text-white shadow-xs ring-1 ring-emerald-500 font-black"
+                                              : "bg-white text-emerald-800 border border-emerald-300 hover:bg-emerald-50 hover:text-emerald-900 font-bold"
                                           )}
                                           title={row.isPresent ? "Currently marked Present" : "Click to mark Present"}
                                         >
@@ -1299,10 +1299,10 @@ export default function DailyAttendanceReport({
                                           onClick={() => handleToggleAttendance(row, 'absent')}
                                           disabled={isUpdating}
                                           className={cn(
-                                            "px-2 py-0.5 rounded text-[10px] font-black uppercase tracking-wider flex items-center space-x-1 transition-all cursor-pointer disabled:opacity-50",
+                                            "px-2 py-0.5 rounded text-[10px] font-black uppercase tracking-wider flex items-center space-x-1 transition-all cursor-pointer disabled:opacity-50 shadow-xs",
                                             !row.isPresent
-                                              ? "bg-rose-600 text-white shadow-xs"
-                                              : "bg-gray-100 text-gray-500 hover:bg-rose-50 hover:text-rose-700"
+                                              ? "bg-rose-600 text-white shadow-xs ring-1 ring-rose-500 font-black"
+                                              : "bg-white text-rose-800 border border-rose-300 hover:bg-rose-50 hover:text-rose-900 font-bold"
                                           )}
                                           title={!row.isPresent ? "Currently marked Absent" : "Click to mark Absent & reverse credit"}
                                         >
@@ -1361,23 +1361,23 @@ export default function DailyAttendanceReport({
                                 {/* 1-Click Toggle Action: Present & Absent Buttons */}
                                 <td className="py-3.5 px-4 text-center whitespace-nowrap min-w-[210px]">
                                   <div className="flex items-center justify-center space-x-1.5">
-                                    <div className="inline-flex items-center p-1 bg-gray-100 rounded-xl space-x-1 border border-gray-200">
+                                    <div className="inline-flex items-center p-1 bg-gray-200/80 rounded-xl space-x-1.5 border border-gray-300 shadow-xs">
                                       <button
                                         type="button"
                                         onClick={() => handleToggleAttendance(row, 'present')}
                                         disabled={isUpdating}
                                         className={cn(
-                                          "px-2.5 py-1.5 rounded-lg font-black text-[11px] uppercase tracking-wider transition-all flex items-center space-x-1 cursor-pointer disabled:opacity-50",
+                                          "px-3 py-1.5 rounded-lg font-black text-xs uppercase tracking-wider transition-all flex items-center space-x-1.5 cursor-pointer disabled:opacity-50 shadow-xs",
                                           row.isPresent
-                                            ? "bg-emerald-600 text-white shadow-xs ring-1 ring-emerald-500"
-                                            : "bg-white text-gray-500 hover:text-emerald-700 hover:bg-emerald-50 border border-transparent hover:border-emerald-200"
+                                            ? "bg-emerald-600 text-white shadow-xs ring-2 ring-emerald-500 font-black"
+                                            : "bg-white text-emerald-800 hover:bg-emerald-50 hover:text-emerald-900 border border-emerald-300 font-bold"
                                         )}
                                         title={row.isPresent ? "Currently marked Present" : "Click to mark Present & credit attendance"}
                                       >
                                         {isUpdating && !row.isPresent ? (
-                                          <RefreshCw size={11} className="animate-spin" />
+                                          <RefreshCw size={12} className="animate-spin" />
                                         ) : (
-                                          <CheckCircle2 size={12} className={row.isPresent ? "text-white" : "text-emerald-600"} />
+                                          <CheckCircle2 size={13} className={row.isPresent ? "text-white" : "text-emerald-600"} />
                                         )}
                                         <span>Present</span>
                                       </button>
@@ -1387,17 +1387,17 @@ export default function DailyAttendanceReport({
                                         onClick={() => handleToggleAttendance(row, 'absent')}
                                         disabled={isUpdating}
                                         className={cn(
-                                          "px-2.5 py-1.5 rounded-lg font-black text-[11px] uppercase tracking-wider transition-all flex items-center space-x-1 cursor-pointer disabled:opacity-50",
+                                          "px-3 py-1.5 rounded-lg font-black text-xs uppercase tracking-wider transition-all flex items-center space-x-1.5 cursor-pointer disabled:opacity-50 shadow-xs",
                                           !row.isPresent
-                                            ? "bg-rose-600 text-white shadow-xs ring-1 ring-rose-500"
-                                            : "bg-white text-gray-500 hover:text-rose-700 hover:bg-rose-50 border border-transparent hover:border-rose-200"
+                                            ? "bg-rose-600 text-white shadow-xs ring-2 ring-rose-500 font-black"
+                                            : "bg-white text-rose-800 hover:bg-rose-50 hover:text-rose-900 border border-rose-300 font-bold"
                                         )}
                                         title={!row.isPresent ? "Currently marked Absent" : "Click to mark Absent & reverse credit error"}
                                       >
                                         {isUpdating && row.isPresent ? (
-                                          <RefreshCw size={11} className="animate-spin" />
+                                          <RefreshCw size={12} className="animate-spin" />
                                         ) : (
-                                          <XCircle size={12} className={!row.isPresent ? "text-white" : "text-rose-600"} />
+                                          <XCircle size={13} className={!row.isPresent ? "text-white" : "text-rose-600"} />
                                         )}
                                         <span>Absent</span>
                                       </button>

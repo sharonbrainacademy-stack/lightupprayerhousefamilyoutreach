@@ -12,7 +12,7 @@ import {
   FileCode2, ClipboardPaste, ChevronLeft, ChevronRight, UserCheck, RotateCcw,
   Edit3, Sliders, UserX, ArrowUpRight, CheckSquare, XCircle, HeartHandshake
 } from 'lucide-react';
-import { collection, onSnapshot, doc, updateDoc, setDoc, addDoc, deleteDoc, serverTimestamp, getDocs, writeBatch, query, orderBy, limit, arrayRemove, arrayUnion, increment } from 'firebase/firestore';
+import { collection, onSnapshot, doc, updateDoc, setDoc, addDoc, deleteDoc, serverTimestamp, getDocs, writeBatch, query, where, orderBy, limit, arrayRemove, arrayUnion, increment } from 'firebase/firestore';
 import { db } from '../lib/firebase';
 import { UserProfile, ZoomSessionItem, ZoomParticipantLog } from '../types';
 import { getTodayDateString } from '../lib/attendance';
@@ -88,6 +88,8 @@ export default function ZoomAttendanceSync({ members, onRefreshMembers, onNaviga
   // Post-sync immediate manual correction station
   const [syncedSessionCorrection, setSyncedSessionCorrection] = useState<SyncedSessionCorrection | null>(null);
   const [correctionSearchFilter, setCorrectionSearchFilter] = useState('');
+  const [correctionStatusFilter, setCorrectionStatusFilter] = useState<'all' | 'present' | 'absent' | 'guest'>('all');
+  const [correctionCommunityFilter, setCorrectionCommunityFilter] = useState<string>('all');
   const [editingMinutesRowId, setEditingMinutesRowId] = useState<string | null>(null);
   const [editingMinutesValue, setEditingMinutesValue] = useState<number>(60);
   const [reassigningLogId, setReassigningLogId] = useState<string | null>(null);
@@ -1138,10 +1140,50 @@ export default function ZoomAttendanceSync({ members, onRefreshMembers, onNaviga
         await batch.commit();
       }
 
-      const todayBadge = isToday ? "Today's Attendance" : `Session Date: ${meetingDate}`;
-      setSyncSuccessMsg(`🎉 Success! Recorded attendance for ${parsedRows.length} participants (${totalSessionMinutes} total prayer minutes credited for ${todayBadge}) into the database! Review or make corrections below.`);
+      // Collect matched member UIDs from parsed rows
+      const matchedMemberUids = new Set<string>();
+      for (const row of parsedRows) {
+        if (row.matchedMember?.uid) {
+          matchedMemberUids.add(row.matchedMember.uid);
+        }
+      }
 
-      // Keep in active correction station
+      // Identify ALL absent registered members
+      const absentMembers = members.filter(m => {
+        const uid = m.uid || (m as any).id;
+        return uid && !matchedMemberUids.has(uid);
+      });
+
+      // Add absent members to createdLogs for comprehensive manual verification
+      for (const mem of absentMembers) {
+        createdLogs.push({
+          logId: `absent-${mem.uid}-${meetingDate}`,
+          name: (mem.displayName || mem.email || 'Member').trim(),
+          email: mem.email || '',
+          durationMinutes: 0,
+          joinTime: '',
+          leaveTime: '',
+          isMember: true,
+          memberUid: mem.uid,
+          matchedMember: mem,
+          whatsappCommunity: getMemberWhatsAppCommunity(mem),
+          date: meetingDate,
+          status: 'reversed_absent' // Absent status
+        });
+      }
+
+      // Sort: Present members first (alphabetical), then Absent members (alphabetical)
+      createdLogs.sort((a, b) => {
+        if (a.status !== b.status) {
+          return a.status === 'present' ? -1 : 1;
+        }
+        return a.name.localeCompare(b.name, undefined, { sensitivity: 'base' });
+      });
+
+      const todayBadge = isToday ? "Today's Attendance" : `Session Date: ${meetingDate}`;
+      setSyncSuccessMsg(`🎉 Auto-Marking Complete! Successfully recorded ${parsedRows.length} present attendees and compiled ${absentMembers.length} absent members for date ${meetingDate}. Review, verify, or edit statuses below.`);
+
+      // Keep in active correction station with BOTH present and absent members
       setSyncedSessionCorrection({
         sessionId: sessionId,
         title: meetingTitle.trim(),
@@ -1164,6 +1206,7 @@ export default function ZoomAttendanceSync({ members, onRefreshMembers, onNaviga
   };
 
   // Immediate manual error correction: Toggle or explicitly set attendance status (Present or Absent)
+  // Supports both attendees and previously absent members!
   const handleToggleSyncedRowAttendance = async (item: SyncedCorrectionRow, forceTargetStatus?: 'present' | 'reversed_absent') => {
     try {
       const isCurrentlyPresent = item.status === 'present';
@@ -1172,11 +1215,30 @@ export default function ZoomAttendanceSync({ members, onRefreshMembers, onNaviga
         if (forceTargetStatus === 'reversed_absent' && !isCurrentlyPresent) return;
       }
       const newStatus: 'present' | 'reversed_absent' = forceTargetStatus || (isCurrentlyPresent ? 'reversed_absent' : 'present');
+      const assignedMinutes = item.durationMinutes > 0 ? item.durationMinutes : 60;
+      let effectiveLogId = item.logId;
 
-      // 1. Update Zoom participant log doc
-      if (item.logId) {
+      // 1. Update or create Zoom participant log doc in Firestore
+      if (newStatus === 'present' && (!item.logId || item.logId.startsWith('absent-'))) {
+        const newLogRef = doc(collection(db, 'zoom_participant_logs'));
+        await setDoc(newLogRef, {
+          sessionId: syncedSessionCorrection?.sessionId || '',
+          sessionTitle: syncedSessionCorrection?.title || 'Prayer Session',
+          name: item.name,
+          email: item.email || '',
+          durationMinutes: assignedMinutes,
+          date: item.date,
+          isMember: !!item.memberUid,
+          memberUid: item.memberUid || '',
+          whatsappCommunity: item.whatsappCommunity || '',
+          status: 'synced',
+          createdAt: serverTimestamp()
+        });
+        effectiveLogId = newLogRef.id;
+      } else if (item.logId && !item.logId.startsWith('absent-')) {
         await updateDoc(doc(db, 'zoom_participant_logs', item.logId), {
-          status: newStatus
+          status: newStatus,
+          ...(newStatus === 'present' && item.durationMinutes === 0 ? { durationMinutes: assignedMinutes } : {})
         });
       }
 
@@ -1188,6 +1250,7 @@ export default function ZoomAttendanceSync({ members, onRefreshMembers, onNaviga
           const isToday = item.date === getTodayDateString();
           const currentDaysList = Array.isArray(mem.attendanceDaysList) ? [...mem.attendanceDaysList] : [];
           const currentDailyMap = mem.dailyMinutes ? { ...mem.dailyMinutes } : {};
+          const minutesToAdjust = isCurrentlyPresent ? (item.durationMinutes || 60) : assignedMinutes;
 
           if (isCurrentlyPresent) {
             // Reversing to ABSENT: remove date from list and delete daily minutes
@@ -1195,23 +1258,23 @@ export default function ZoomAttendanceSync({ members, onRefreshMembers, onNaviga
             await updateDoc(userRef, {
               attendanceDaysList: arrayRemove(item.date),
               attendanceCount: Math.max(0, (mem.attendanceCount || currentDaysList.length) - 1),
-              totalMinutes: Math.max(0, (mem.totalMinutes || 0) - item.durationMinutes),
+              totalMinutes: Math.max(0, (mem.totalMinutes || 0) - minutesToAdjust),
               dailyMinutes: currentDailyMap,
               manualAdjustmentNote: `Reversed Zoom credit to ABSENT on ${new Date().toLocaleDateString()}`,
-              ...(isToday ? { todayMinutes: Math.max(0, (mem.todayMinutes || 0) - item.durationMinutes) } : {})
+              ...(isToday ? { todayMinutes: Math.max(0, (mem.todayMinutes || 0) - minutesToAdjust) } : {})
             });
           } else {
-            // Restoring back to PRESENT
+            // Restoring or marking as PRESENT
             const isNewDay = !currentDaysList.includes(item.date);
-            currentDailyMap[item.date] = item.durationMinutes;
+            currentDailyMap[item.date] = assignedMinutes;
             await updateDoc(userRef, {
               attendanceDaysList: arrayUnion(item.date),
               lastAttendedDate: item.date,
               attendanceCount: increment(isNewDay ? 1 : 0),
-              totalMinutes: (mem.totalMinutes || 0) + item.durationMinutes,
+              totalMinutes: (mem.totalMinutes || 0) + assignedMinutes,
               dailyMinutes: currentDailyMap,
-              manualAdjustmentNote: `Restored Zoom credit to PRESENT on ${new Date().toLocaleDateString()}`,
-              ...(isToday ? { todayMinutes: (mem.todayMinutes || 0) + item.durationMinutes } : {})
+              manualAdjustmentNote: `Marked/restored Zoom credit to PRESENT on ${new Date().toLocaleDateString()}`,
+              ...(isToday ? { todayMinutes: (mem.todayMinutes || 0) + assignedMinutes } : {})
             });
           }
         }
@@ -1222,19 +1285,127 @@ export default function ZoomAttendanceSync({ members, onRefreshMembers, onNaviga
         if (!prev) return null;
         return {
           ...prev,
-          rows: prev.rows.map(r => r.logId === item.logId ? { ...r, status: newStatus } : r)
+          rows: prev.rows.map(r => {
+            if (r.logId === item.logId || (r.memberUid && r.memberUid === item.memberUid)) {
+              return {
+                ...r,
+                logId: effectiveLogId,
+                status: newStatus,
+                durationMinutes: newStatus === 'present' ? assignedMinutes : 0
+              };
+            }
+            return r;
+          })
         };
       });
 
       if (onRefreshMembers) onRefreshMembers();
-      setSyncSuccessMsg(isCurrentlyPresent 
-        ? `Reversed "${item.name}" to ABSENT. Attendance day and ${item.durationMinutes}m subtracted.`
-        : `Restored "${item.name}" to PRESENT (${item.durationMinutes}m credited).`
+      setSyncSuccessMsg(newStatus === 'present'
+        ? `Marked "${item.name}" as PRESENT (${assignedMinutes}m credited).`
+        : `Reversed "${item.name}" to ABSENT.`
       );
-      setTimeout(() => setSyncSuccessMsg(''), 5000);
+      setTimeout(() => setSyncSuccessMsg(''), 4000);
     } catch (err: any) {
       console.error('Error toggling attendance for synced participant:', err);
       setSyncErrorMsg('Failed to update record: ' + err?.message);
+    }
+  };
+
+  // Load ANY past saved session into the Verification & Editing Station
+  const handleOpenSessionVerification = async (session: ZoomSessionItem) => {
+    try {
+      setIsSyncing(true);
+      setSyncSuccessMsg('');
+      setSyncErrorMsg('');
+
+      // Fetch participant logs for this session
+      const q = query(
+        collection(db, 'zoom_participant_logs'),
+        where('sessionId', '==', session.id)
+      );
+      const snap = await getDocs(q);
+      const sessionLogsList = snap.docs.map(doc => ({
+        id: doc.id,
+        ...doc.data()
+      })) as ZoomParticipantLog[];
+
+      const matchedMemberUids = new Set<string>();
+      const rows: SyncedCorrectionRow[] = [];
+
+      for (const log of sessionLogsList) {
+        if (log.memberUid) {
+          matchedMemberUids.add(log.memberUid);
+        }
+        const matchedMem = members.find(m => m.uid === log.memberUid) || null;
+        rows.push({
+          logId: log.id,
+          name: log.name,
+          email: log.email || '',
+          durationMinutes: log.durationMinutes || 0,
+          joinTime: log.joinTime || '',
+          leaveTime: log.leaveTime || '',
+          isMember: log.isMember,
+          memberUid: log.memberUid || '',
+          matchedMember: matchedMem,
+          whatsappCommunity: log.whatsappCommunity || (matchedMem ? getMemberWhatsAppCommunity(matchedMem) : ''),
+          date: session.meetingDate,
+          status: log.status === 'reversed_absent' ? 'reversed_absent' : 'present'
+        });
+      }
+
+      // Add all absent registered members
+      const absentMembers = members.filter(m => {
+        const uid = m.uid || (m as any).id;
+        return uid && !matchedMemberUids.has(uid);
+      });
+
+      for (const mem of absentMembers) {
+        rows.push({
+          logId: `absent-${mem.uid}-${session.meetingDate}`,
+          name: (mem.displayName || mem.email || 'Member').trim(),
+          email: mem.email || '',
+          durationMinutes: 0,
+          joinTime: '',
+          leaveTime: '',
+          isMember: true,
+          memberUid: mem.uid,
+          matchedMember: mem,
+          whatsappCommunity: getMemberWhatsAppCommunity(mem),
+          date: session.meetingDate,
+          status: 'reversed_absent'
+        });
+      }
+
+      // Sort: Present first, then Absent
+      rows.sort((a, b) => {
+        if (a.status !== b.status) {
+          return a.status === 'present' ? -1 : 1;
+        }
+        return a.name.localeCompare(b.name, undefined, { sensitivity: 'base' });
+      });
+
+      setSyncedSessionCorrection({
+        sessionId: session.id,
+        title: session.title,
+        date: session.meetingDate,
+        totalParticipants: sessionLogsList.filter(l => l.status !== 'reversed_absent').length,
+        totalMinutes: session.totalMinutes,
+        rows: rows
+      });
+
+      setActiveSubTab('import');
+      setSelectedSession(null);
+      setSyncSuccessMsg(`Loaded session "${session.title}" (${session.meetingDate}) with ${rows.filter(r => r.status === 'present').length} Present and ${rows.filter(r => r.status !== 'present').length} Absent members for manual verification and editing.`);
+      setTimeout(() => {
+        if (correctionTableScrollRef.current) {
+          correctionTableScrollRef.current.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        }
+      }, 100);
+    } catch (err: any) {
+      console.error('Error opening session verification:', err);
+      setSyncErrorMsg('Failed to load session: ' + err?.message);
+    } finally {
+      setIsSyncing(false);
     }
   };
 
@@ -2282,21 +2453,90 @@ export default function ZoomAttendanceSync({ members, onRefreshMembers, onNaviga
                 </div>
               </div>
 
-              {/* Correction Table Header & Search */}
-              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-                <div className="relative flex-1 max-w-sm">
-                  <Search size={16} className="absolute left-3.5 top-1/2 -translate-y-1/2 text-gray-400" />
-                  <input
-                    type="text"
-                    value={correctionSearchFilter}
-                    onChange={(e) => setCorrectionSearchFilter(e.target.value)}
-                    placeholder="Search synced attendees to correct..."
-                    className="w-full pl-10 pr-4 py-2.5 bg-gray-50 rounded-xl text-xs font-bold border outline-none focus:ring-2 focus:ring-[#F26522]"
-                  />
+              {/* Comprehensive Metric Cards */}
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+                <div className="bg-white p-4 rounded-2xl border border-gray-200 shadow-xs space-y-1">
+                  <span className="text-[10px] font-black uppercase text-gray-400">Total Evaluated</span>
+                  <p className="text-2xl font-black text-[#1A1F3C]">{syncedSessionCorrection.rows.length}</p>
                 </div>
+                <div className="bg-emerald-50/70 p-4 rounded-2xl border border-emerald-200 shadow-xs space-y-1">
+                  <span className="text-[10px] font-black uppercase text-emerald-700">Present Members</span>
+                  <p className="text-2xl font-black text-emerald-600">
+                    {syncedSessionCorrection.rows.filter(r => r.status === 'present').length}
+                  </p>
+                </div>
+                <div className="bg-rose-50/70 p-4 rounded-2xl border border-rose-200 shadow-xs space-y-1">
+                  <span className="text-[10px] font-black uppercase text-rose-700">Absent Members</span>
+                  <p className="text-2xl font-black text-rose-600">
+                    {syncedSessionCorrection.rows.filter(r => r.status !== 'present').length}
+                  </p>
+                </div>
+                <div className="bg-blue-50/70 p-4 rounded-2xl border border-blue-200 shadow-xs space-y-1">
+                  <span className="text-[10px] font-black uppercase text-blue-700">Total Prayer Time</span>
+                  <p className="text-2xl font-black text-blue-600">
+                    {syncedSessionCorrection.rows.filter(r => r.status === 'present').reduce((acc, r) => acc + (r.durationMinutes || 0), 0)}m
+                  </p>
+                </div>
+              </div>
 
-                <div className="flex items-center space-x-2">
-                  {/* Stable horizontal scroll buttons */}
+              {/* Correction Table Header, Status Filters & Search */}
+              <div className="flex flex-col gap-3">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  {/* Status Filter Tabs */}
+                  <div className="flex flex-wrap items-center gap-1.5 bg-gray-100 p-1.5 rounded-2xl border border-gray-200">
+                    <button
+                      type="button"
+                      onClick={() => setCorrectionStatusFilter('all')}
+                      className={cn(
+                        "px-3 py-1.5 rounded-xl text-xs font-black uppercase tracking-wider transition-all cursor-pointer",
+                        correctionStatusFilter === 'all'
+                          ? "bg-[#1A1F3C] text-white shadow-xs"
+                          : "text-gray-600 hover:text-[#1A1F3C] hover:bg-white"
+                      )}
+                    >
+                      All ({syncedSessionCorrection.rows.length})
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setCorrectionStatusFilter('present')}
+                      className={cn(
+                        "px-3 py-1.5 rounded-xl text-xs font-black uppercase tracking-wider transition-all cursor-pointer flex items-center space-x-1",
+                        correctionStatusFilter === 'present'
+                          ? "bg-emerald-600 text-white shadow-xs"
+                          : "text-emerald-700 hover:bg-emerald-50"
+                      )}
+                    >
+                      <CheckCircle2 size={12} />
+                      <span>Present ({syncedSessionCorrection.rows.filter(r => r.status === 'present').length})</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setCorrectionStatusFilter('absent')}
+                      className={cn(
+                        "px-3 py-1.5 rounded-xl text-xs font-black uppercase tracking-wider transition-all cursor-pointer flex items-center space-x-1",
+                        correctionStatusFilter === 'absent'
+                          ? "bg-rose-600 text-white shadow-xs"
+                          : "text-rose-700 hover:bg-rose-50"
+                      )}
+                    >
+                      <XCircle size={12} />
+                      <span>Absent ({syncedSessionCorrection.rows.filter(r => r.status !== 'present').length})</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setCorrectionStatusFilter('guest')}
+                      className={cn(
+                        "px-3 py-1.5 rounded-xl text-xs font-black uppercase tracking-wider transition-all cursor-pointer flex items-center space-x-1",
+                        correctionStatusFilter === 'guest'
+                          ? "bg-purple-700 text-white shadow-xs"
+                          : "text-purple-700 hover:bg-purple-50"
+                      )}
+                    >
+                      <span>Guests ({syncedSessionCorrection.rows.filter(r => !r.isMember).length})</span>
+                    </button>
+                  </div>
+
+                  {/* Horizontal Scroll Columns Controls */}
                   <div className="flex items-center space-x-1.5 bg-gray-100 p-1 rounded-xl">
                     <span className="text-[10px] font-black uppercase text-gray-400 px-1 hidden sm:inline">Columns:</span>
                     <button
@@ -2316,10 +2556,34 @@ export default function ZoomAttendanceSync({ members, onRefreshMembers, onNaviga
                       <ChevronRight size={13} className="text-[#F26522]" />
                     </button>
                   </div>
+                </div>
 
-                  <span className="text-xs font-bold text-gray-500">
-                    {syncedSessionCorrection.rows.filter(r => r.status === 'present').length} Present • {syncedSessionCorrection.rows.filter(r => r.status === 'reversed_absent').length} Reversed Absent
-                  </span>
+                {/* Filter and Search Bar */}
+                <div className="flex flex-col sm:flex-row items-center justify-between gap-3">
+                  <div className="relative flex-1 w-full max-w-sm">
+                    <Search size={16} className="absolute left-3.5 top-1/2 -translate-y-1/2 text-gray-400" />
+                    <input
+                      type="text"
+                      value={correctionSearchFilter}
+                      onChange={(e) => setCorrectionSearchFilter(e.target.value)}
+                      placeholder="Search present or absent members..."
+                      className="w-full pl-10 pr-4 py-2.5 bg-gray-50 rounded-xl text-xs font-bold border outline-none focus:ring-2 focus:ring-[#F26522]"
+                    />
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-2 w-full sm:w-auto">
+                    <select
+                      value={correctionCommunityFilter}
+                      onChange={(e) => setCorrectionCommunityFilter(e.target.value)}
+                      className="px-3.5 py-2.5 bg-gray-50 border border-gray-200 rounded-xl text-xs font-bold text-[#1A1F3C] outline-none cursor-pointer"
+                    >
+                      <option value="all">Filter: All WhatsApp Communities</option>
+                      {dynamicCommunityOptions.map(opt => (
+                        <option key={opt} value={opt}>{opt}</option>
+                      ))}
+                      <option value="Unassigned">Unassigned Community</option>
+                    </select>
+                  </div>
                 </div>
               </div>
 
@@ -2332,30 +2596,43 @@ export default function ZoomAttendanceSync({ members, onRefreshMembers, onNaviga
                 <table className="min-w-[1080px] w-full text-left border-collapse text-xs">
                   <thead>
                     <tr className="bg-gray-50 text-gray-600 font-black uppercase tracking-wider border-b border-gray-200">
-                      <th className="sticky left-0 top-0 z-30 bg-gray-50 p-4 border-r border-b border-gray-200 shadow-[2px_0_4px_rgba(0,0,0,0.05)] min-w-[230px]">Attendee Name</th>
-                      <th className="sticky top-0 z-20 bg-gray-50 p-4 border-b border-gray-200 min-w-[210px] text-center">Manual Correction (Present / Absent)</th>
-                      <th className="sticky top-0 z-20 bg-gray-50 p-4 border-b border-gray-200 min-w-[150px]">Current Status</th>
+                      <th className="sticky left-0 top-0 z-30 bg-gray-50 p-4 border-r border-b border-gray-200 shadow-[2px_0_4px_rgba(0,0,0,0.05)] min-w-[240px]">Member / Attendee Name</th>
+                      <th className="sticky top-0 z-20 bg-gray-50 p-4 border-b border-gray-200 min-w-[220px] text-center">Manual Correction (Present / Absent)</th>
+                      <th className="sticky top-0 z-20 bg-gray-50 p-4 border-b border-gray-200 min-w-[170px]">Verification Status</th>
                       <th className="sticky top-0 z-20 bg-gray-50 p-4 border-b border-gray-200 min-w-[180px]">Member Account</th>
-                      <th className="sticky top-0 z-20 bg-gray-50 p-4 border-b border-gray-200 min-w-[160px]">WhatsApp Group</th>
+                      <th className="sticky top-0 z-20 bg-gray-50 p-4 border-b border-gray-200 min-w-[160px]">WhatsApp Community</th>
                       <th className="sticky top-0 z-20 bg-gray-50 p-4 border-b border-gray-200 text-center min-w-[140px]">Prayer Duration</th>
-                      <th className="sticky top-0 z-20 bg-gray-50 p-4 border-b border-gray-200 text-right min-w-[110px]">Reassign</th>
+                      <th className="sticky top-0 z-20 bg-gray-50 p-4 border-b border-gray-200 text-right min-w-[130px]">Follow-Up / Action</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-gray-100 text-xs font-medium">
                     {syncedSessionCorrection.rows
                       .filter(r => {
-                        if (!correctionSearchFilter) return true;
-                        const q = correctionSearchFilter.toLowerCase();
-                        return r.name.toLowerCase().includes(q) || r.email.toLowerCase().includes(q);
+                        if (correctionStatusFilter === 'present' && r.status !== 'present') return false;
+                        if (correctionStatusFilter === 'absent' && r.status === 'present') return false;
+                        if (correctionStatusFilter === 'guest' && r.isMember) return false;
+
+                        if (correctionCommunityFilter !== 'all') {
+                          const comm = (r.whatsappCommunity || 'Unassigned').toLowerCase().trim();
+                          if (comm !== correctionCommunityFilter.toLowerCase().trim()) return false;
+                        }
+
+                        if (correctionSearchFilter.trim()) {
+                          const q = correctionSearchFilter.toLowerCase().trim();
+                          return r.name.toLowerCase().includes(q) || (r.email && r.email.toLowerCase().includes(q));
+                        }
+                        return true;
                       })
                       .map((row) => {
                         const isPresent = row.status === 'present';
                         const isEditingMins = editingMinutesRowId === row.logId;
+                        const rawPhone = row.matchedMember?.phone || row.matchedMember?.whatsappGroup || '';
+                        const cleanDigits = rawPhone.replace(/\D/g, '');
 
                         return (
-                          <tr key={row.logId} className={cn("hover:bg-gray-50/80 transition-colors", !isPresent && "bg-rose-50/30")}>
+                          <tr key={row.logId || row.name} className={cn("hover:bg-gray-50/80 transition-colors", !isPresent && "bg-rose-50/25")}>
                             {/* Sticky Name with direct Present and Absent buttons against each name */}
-                            <td className="sticky left-0 z-10 p-4 font-bold text-[#1A1F3C] bg-white border-r border-gray-200 shadow-[2px_0_4px_rgba(0,0,0,0.05)] min-w-[230px]">
+                            <td className="sticky left-0 z-10 p-4 font-bold text-[#1A1F3C] bg-white border-r border-gray-200 shadow-[2px_0_4px_rgba(0,0,0,0.05)] min-w-[240px]">
                               <div className="flex items-start space-x-2">
                                 <span className={cn(
                                   "w-7 h-7 rounded-full text-white text-xs font-black flex items-center justify-center shrink-0 mt-0.5",
@@ -2372,10 +2649,10 @@ export default function ZoomAttendanceSync({ members, onRefreshMembers, onNaviga
                                       type="button"
                                       onClick={() => handleToggleSyncedRowAttendance(row, 'present')}
                                       className={cn(
-                                        "px-2 py-0.5 rounded text-[10px] font-black uppercase tracking-wider flex items-center space-x-1 transition-all cursor-pointer",
+                                        "px-2 py-0.5 rounded text-[10px] font-black uppercase tracking-wider flex items-center space-x-1 transition-all cursor-pointer shadow-xs",
                                         isPresent
-                                          ? "bg-emerald-600 text-white shadow-xs"
-                                          : "bg-gray-100 text-gray-500 hover:bg-emerald-50 hover:text-emerald-700"
+                                          ? "bg-emerald-600 text-white shadow-xs font-black"
+                                          : "bg-white text-emerald-800 border border-emerald-300 hover:bg-emerald-50 font-bold"
                                       )}
                                       title={isPresent ? "Currently marked Present" : "Click to mark Present & credit"}
                                     >
@@ -2386,10 +2663,10 @@ export default function ZoomAttendanceSync({ members, onRefreshMembers, onNaviga
                                       type="button"
                                       onClick={() => handleToggleSyncedRowAttendance(row, 'reversed_absent')}
                                       className={cn(
-                                        "px-2 py-0.5 rounded text-[10px] font-black uppercase tracking-wider flex items-center space-x-1 transition-all cursor-pointer",
+                                        "px-2 py-0.5 rounded text-[10px] font-black uppercase tracking-wider flex items-center space-x-1 transition-all cursor-pointer shadow-xs",
                                         !isPresent
-                                          ? "bg-rose-600 text-white shadow-xs"
-                                          : "bg-gray-100 text-gray-500 hover:bg-rose-50 hover:text-rose-700"
+                                          ? "bg-rose-600 text-white shadow-xs font-black"
+                                          : "bg-white text-rose-800 border border-rose-300 hover:bg-rose-50 font-bold"
                                       )}
                                       title={!isPresent ? "Currently marked Absent" : "Click to mark Absent & reverse credit"}
                                     >
@@ -2401,17 +2678,17 @@ export default function ZoomAttendanceSync({ members, onRefreshMembers, onNaviga
                               </div>
                             </td>
 
-                            {/* One-Click Action: Present & Absent Buttons (Column 2, right beside name) */}
-                            <td className="p-4 min-w-[210px] text-center">
-                              <div className="inline-flex items-center p-1 bg-gray-100 rounded-xl space-x-1 border border-gray-200">
+                            {/* One-Click Action: Present & Absent Buttons (High Contrast & Visible) */}
+                            <td className="p-4 min-w-[220px] text-center">
+                              <div className="inline-flex items-center p-1 bg-gray-200/80 rounded-xl space-x-1.5 border border-gray-300 shadow-xs">
                                 <button
                                   type="button"
                                   onClick={() => handleToggleSyncedRowAttendance(row, 'present')}
                                   className={cn(
-                                    "px-2.5 py-1.5 rounded-lg text-xs font-black uppercase tracking-wider flex items-center space-x-1 transition-all cursor-pointer",
+                                    "px-3 py-1.5 rounded-lg text-xs font-black uppercase tracking-wider flex items-center space-x-1 transition-all cursor-pointer shadow-xs",
                                     isPresent
-                                      ? "bg-emerald-600 text-white shadow-xs ring-1 ring-emerald-500"
-                                      : "bg-white text-gray-500 hover:text-emerald-700 hover:bg-emerald-50 border border-transparent hover:border-emerald-200"
+                                      ? "bg-emerald-600 text-white shadow-xs ring-2 ring-emerald-500 font-black"
+                                      : "bg-white text-emerald-800 hover:bg-emerald-50 hover:text-emerald-900 border border-emerald-300 font-bold"
                                   )}
                                   title={isPresent ? "Currently marked Present" : "Click to mark Present & credit attendance"}
                                 >
@@ -2423,10 +2700,10 @@ export default function ZoomAttendanceSync({ members, onRefreshMembers, onNaviga
                                   type="button"
                                   onClick={() => handleToggleSyncedRowAttendance(row, 'reversed_absent')}
                                   className={cn(
-                                    "px-2.5 py-1.5 rounded-lg text-xs font-black uppercase tracking-wider flex items-center space-x-1 transition-all cursor-pointer",
+                                    "px-3 py-1.5 rounded-lg text-xs font-black uppercase tracking-wider flex items-center space-x-1 transition-all cursor-pointer shadow-xs",
                                     !isPresent
-                                      ? "bg-rose-600 text-white shadow-xs ring-1 ring-rose-500"
-                                      : "bg-white text-gray-500 hover:text-rose-700 hover:bg-rose-50 border border-transparent hover:border-rose-200"
+                                      ? "bg-rose-600 text-white shadow-xs ring-2 ring-rose-500 font-black"
+                                      : "bg-white text-rose-800 hover:bg-rose-50 hover:text-rose-900 border border-rose-300 font-bold"
                                   )}
                                   title={!isPresent ? "Currently marked Absent" : "Click to mark Absent & reverse credit error"}
                                 >
@@ -2437,7 +2714,7 @@ export default function ZoomAttendanceSync({ members, onRefreshMembers, onNaviga
                             </td>
 
                             {/* Status */}
-                            <td className="p-4 min-w-[150px]">
+                            <td className="p-4 min-w-[170px]">
                               {isPresent ? (
                                 <span className="inline-flex items-center space-x-1 px-3 py-1 bg-emerald-100 text-emerald-800 text-[11px] font-black rounded-full border border-emerald-300">
                                   <CheckCircle2 size={13} className="text-emerald-600 shrink-0" />
@@ -2445,8 +2722,8 @@ export default function ZoomAttendanceSync({ members, onRefreshMembers, onNaviga
                                 </span>
                               ) : (
                                 <span className="inline-flex items-center space-x-1 px-3 py-1 bg-rose-100 text-rose-800 text-[11px] font-black rounded-full border border-rose-300">
-                                  <X size={13} className="text-rose-600 shrink-0" />
-                                  <span>REVERSED (ABSENT)</span>
+                                  <XCircle size={13} className="text-rose-600 shrink-0" />
+                                  <span>ABSENT (UNCREDITED)</span>
                                 </span>
                               )}
                             </td>
@@ -2467,8 +2744,9 @@ export default function ZoomAttendanceSync({ members, onRefreshMembers, onNaviga
 
                             {/* Community */}
                             <td className="p-4 min-w-[160px]">
-                              <span className="text-[11px] font-bold text-gray-600">
-                                {row.whatsappCommunity || 'Unassigned'}
+                              <span className="inline-flex items-center space-x-1 text-[11px] font-bold text-gray-700 bg-gray-100 px-2.5 py-1 rounded-lg">
+                                <MessageCircle size={11} className="text-emerald-600 shrink-0" />
+                                <span>{row.whatsappCommunity || 'Unassigned'}</span>
                               </span>
                             </td>
 
@@ -2502,36 +2780,56 @@ export default function ZoomAttendanceSync({ members, onRefreshMembers, onNaviga
                                 </div>
                               ) : (
                                 <div className="flex items-center justify-center space-x-1.5">
-                                  <span className="font-mono font-black text-sm text-[#1A1F3C]">{row.durationMinutes}m</span>
-                                  <button
-                                    type="button"
-                                    onClick={() => {
-                                      setEditingMinutesRowId(row.logId);
-                                      setEditingMinutesValue(row.durationMinutes);
-                                    }}
-                                    className="p-1 text-gray-400 hover:text-[#F26522] hover:bg-orange-50 rounded transition-colors cursor-pointer"
-                                    title="Edit prayer duration"
-                                  >
-                                    <Edit3 size={12} />
-                                  </button>
+                                  <span className={cn(
+                                    "font-mono font-black text-sm",
+                                    isPresent ? "text-[#1A1F3C]" : "text-gray-400"
+                                  )}>
+                                    {row.durationMinutes}m
+                                  </span>
+                                  {isPresent && (
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        setEditingMinutesRowId(row.logId);
+                                        setEditingMinutesValue(row.durationMinutes);
+                                      }}
+                                      className="p-1 hover:bg-gray-100 rounded text-gray-400 hover:text-[#1A1F3C] cursor-pointer"
+                                      title="Edit minutes"
+                                    >
+                                      <Edit3 size={11} />
+                                    </button>
+                                  )}
                                 </div>
                               )}
                             </td>
 
-                            {/* Reassign Member Button */}
-                            <td className="p-4 text-right min-w-[110px]">
-                              <button
-                                type="button"
-                                onClick={() => {
-                                  setReassigningLogId(row.logId);
-                                  setReassigningSearch(row.name);
-                                }}
-                                className="px-2.5 py-1.5 bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-xl text-xs font-bold transition-all flex items-center space-x-1 cursor-pointer ml-auto"
-                                title="Reassign this attendance log to a different registered member"
-                              >
-                                <UserCheck size={12} className="text-[#F26522]" />
-                                <span>Reassign</span>
-                              </button>
+                            {/* Follow-Up / Reassign Action */}
+                            <td className="p-4 text-right min-w-[130px]">
+                              {!isPresent && cleanDigits.length >= 7 ? (
+                                <a
+                                  href={`https://wa.me/${cleanDigits}?text=${encodeURIComponent(`Praise God ${row.name}, we missed you in today's Light Up Prayer House Zoom meeting (${syncedSessionCorrection.date}). We hope all is well, and we look forward to praying together next time!`)}`}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  className="inline-flex items-center space-x-1 px-2.5 py-1 bg-[#25D366]/15 hover:bg-[#25D366] text-[#128C7E] hover:text-white rounded-lg text-[10px] font-black transition-all cursor-pointer shadow-xs"
+                                  title="Send WhatsApp care message to absent member"
+                                >
+                                  <MessageCircle size={11} />
+                                  <span>Follow Up</span>
+                                </a>
+                              ) : row.matchedMember ? (
+                                <span className="text-[10px] text-gray-400 font-bold">Verified</span>
+                              ) : (
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setReassigningLogId(row.logId);
+                                    setReassigningSearch(row.name);
+                                  }}
+                                  className="px-2 py-1 bg-gray-100 hover:bg-gray-200 text-[#1A1F3C] rounded-lg text-[10px] font-bold cursor-pointer transition-colors"
+                                >
+                                  Link Account
+                                </button>
+                              )}
                             </td>
                           </tr>
                         );
@@ -2704,13 +3002,24 @@ export default function ZoomAttendanceSync({ members, onRefreshMembers, onNaviga
                       <span>Total Time: <strong className="text-[#F26522]">{session.totalMinutes} mins</strong></span>
                     </div>
 
-                    <button
-                      onClick={() => setSelectedSession(session)}
-                      className="w-full flex items-center justify-center space-x-2 py-2.5 bg-[#1A1F3C] hover:bg-[#F26522] text-white rounded-xl text-xs font-black uppercase tracking-wider transition-all cursor-pointer"
-                    >
-                      <Eye size={14} />
-                      <span>View Attendees & Export</span>
-                    </button>
+                    <div className="space-y-2">
+                      <button
+                        onClick={() => handleOpenSessionVerification(session)}
+                        className="w-full flex items-center justify-center space-x-2 py-2.5 bg-gradient-to-r from-amber-600 to-[#F26522] hover:from-amber-700 hover:to-[#d9561a] text-white rounded-xl text-xs font-black uppercase tracking-wider transition-all cursor-pointer shadow-md shadow-[#F26522]/20"
+                        title="Load both Present and Absent members for this session to verify and edit marking at any time"
+                      >
+                        <CheckCircle2 size={14} />
+                        <span>Verify & Edit Result (Present & Absent)</span>
+                      </button>
+
+                      <button
+                        onClick={() => setSelectedSession(session)}
+                        className="w-full flex items-center justify-center space-x-2 py-2 bg-gray-100 hover:bg-gray-200 text-[#1A1F3C] rounded-xl text-xs font-bold uppercase tracking-wider transition-all cursor-pointer"
+                      >
+                        <Eye size={13} />
+                        <span>View Details & Export CSV</span>
+                      </button>
+                    </div>
                   </div>
                 </div>
               ))}
@@ -2745,6 +3054,15 @@ export default function ZoomAttendanceSync({ members, onRefreshMembers, onNaviga
                     Showing {sessionLogs.length} participant logs ({selectedSession.totalMinutes} total minutes)
                   </p>
                   <div className="flex items-center space-x-2">
+                    <button
+                      type="button"
+                      onClick={() => handleOpenSessionVerification(selectedSession)}
+                      className="flex items-center space-x-1.5 px-3 py-1.5 bg-gradient-to-r from-amber-600 to-[#F26522] hover:from-amber-700 hover:to-[#d9561a] text-white rounded-xl text-xs font-black uppercase tracking-wider transition-all cursor-pointer shadow-xs"
+                      title="Open full verification table with both Present and Absent members to edit results"
+                    >
+                      <CheckCircle2 size={13} />
+                      <span>Edit Saved Marking</span>
+                    </button>
                     <button
                       type="button"
                       onClick={() => setShowAddMemberToSessionModal(true)}

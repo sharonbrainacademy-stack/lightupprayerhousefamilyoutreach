@@ -2488,23 +2488,31 @@ export default function AdminDashboard() {
           {/* MEMBERS & ATTENDANCE TAB */}
           {activeTab === 'members' && (
             <div className="space-y-8">
-              {/* Header bar */}
-              <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
-                <div>
-                  <h3 className="text-2xl font-black text-[#1A1F3C]">Members & Prayer Attendance Log</h3>
-                  <p className="text-gray-500 text-sm font-medium">Tracks member sign-ups, days attended, daily minutes, and real-time Zoom presence.</p>
+              {/* Header bar & Prominent Action Command Center */}
+              <div className="bg-white rounded-3xl p-6 border border-gray-100 shadow-sm space-y-5">
+                <div className="flex flex-col md:flex-row md:items-center justify-between gap-3">
+                  <div>
+                    <h3 className="text-2xl font-black text-[#1A1F3C]">Members & Prayer Attendance Log</h3>
+                    <p className="text-gray-500 text-sm font-medium">Tracks member sign-ups, days attended, daily minutes, and real-time Zoom presence.</p>
+                  </div>
+                  <div className="flex items-center space-x-2 text-xs font-black text-gray-500 bg-gray-50 px-3.5 py-1.5 rounded-xl border border-gray-200 shrink-0 self-start md:self-center">
+                    <Users size={14} className="text-[#F26522]" />
+                    <span>{members.length} Registered Members</span>
+                  </div>
                 </div>
-                <div className="flex flex-wrap items-center gap-3">
+
+                {/* Visible Command Action Bar - Guaranteed 100% visible and responsive */}
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3 pt-2 border-t border-gray-100">
                   <button
                     onClick={() => {
                       setAttendanceReportInitialSubTab('reports');
                       setActiveTab('attendance-reports');
                     }}
-                    className="flex items-center justify-center space-x-2 px-5 py-3.5 bg-gradient-to-r from-[#F26522] to-amber-600 hover:from-[#d9561a] hover:to-amber-700 text-white rounded-xl font-black uppercase tracking-widest text-xs shadow-lg shadow-[#F26522]/30 transition-all cursor-pointer"
+                    className="flex items-center justify-center space-x-2 px-4 py-3 bg-gradient-to-r from-[#F26522] to-amber-600 hover:from-[#d9561a] hover:to-amber-700 text-white rounded-xl font-black uppercase tracking-wider text-xs shadow-md shadow-[#F26522]/30 transition-all cursor-pointer border border-[#F26522]"
                     title="View Daily Attendance Reports & Unified Roster"
                   >
                     <ClipboardCheck size={16} />
-                    <span>Daily Attendance Reports</span>
+                    <span>Daily Reports</span>
                   </button>
 
                   <button
@@ -2512,16 +2520,16 @@ export default function AdminDashboard() {
                       setAttendanceReportInitialSubTab('followup');
                       setActiveTab('attendance-reports');
                     }}
-                    className="flex items-center justify-center space-x-2 px-5 py-3.5 bg-rose-600 hover:bg-rose-700 text-white rounded-xl font-black uppercase tracking-widest text-xs shadow-lg shadow-rose-600/30 transition-all cursor-pointer"
+                    className="flex items-center justify-center space-x-2 px-4 py-3 bg-rose-600 hover:bg-rose-700 text-white rounded-xl font-black uppercase tracking-wider text-xs shadow-md shadow-rose-600/30 transition-all cursor-pointer border border-rose-500"
                     title="Follow up all absent members with one-click WhatsApp, call, or email"
                   >
                     <HeartHandshake size={16} />
-                    <span>Absent Follow-Up Hub</span>
+                    <span>Absent Follow-Up</span>
                   </button>
 
                   <button
                     onClick={() => setShowEstherGroupModal(true)}
-                    className="flex items-center justify-center space-x-2 px-5 py-3.5 bg-gradient-to-r from-purple-800 to-indigo-900 hover:from-purple-900 hover:to-indigo-950 text-white rounded-xl font-black uppercase tracking-widest text-xs shadow-lg shadow-purple-900/30 transition-all cursor-pointer border border-purple-400/30"
+                    className="flex items-center justify-center space-x-2 px-4 py-3 bg-gradient-to-r from-purple-800 to-indigo-900 hover:from-purple-900 hover:to-indigo-950 text-white rounded-xl font-black uppercase tracking-wider text-xs shadow-md shadow-purple-900/30 transition-all cursor-pointer border border-purple-400/40"
                     title="View & manage 122 registered Esther Group members"
                   >
                     <Users size={16} className="text-amber-300" />
@@ -2530,19 +2538,21 @@ export default function AdminDashboard() {
 
                   <button
                     onClick={() => setActiveTab('zoom-sync')}
-                    className="flex items-center justify-center space-x-2 px-5 py-3.5 bg-[#1A1F3C] hover:bg-[#282E5C] text-white rounded-xl font-black uppercase tracking-widest text-xs shadow-lg transition-all cursor-pointer"
+                    className="flex items-center justify-center space-x-2 px-4 py-3 bg-[#1A1F3C] hover:bg-[#282E5C] text-white rounded-xl font-black uppercase tracking-wider text-xs shadow-md shadow-[#1A1F3C]/20 transition-all cursor-pointer border border-gray-700"
+                    title="Import Zoom CSV or PDF to automark attendance"
                   >
                     <Upload size={16} className="text-[#F26522]" />
-                    <span>Import Zoom CSV</span>
+                    <span>Auto-Sync Zoom CSV</span>
                   </button>
 
                   <button 
                     onClick={handleExportCSV}
                     disabled={filteredMembers.length === 0}
-                    className="flex items-center justify-center space-x-2 px-6 py-3.5 bg-[#F26522] text-white rounded-xl font-black uppercase tracking-widest text-xs hover:bg-[#d9561a] shadow-lg shadow-[#F26522]/20 transition-all disabled:opacity-50 cursor-pointer"
+                    className="flex items-center justify-center space-x-2 px-4 py-3 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl font-black uppercase tracking-wider text-xs shadow-md shadow-emerald-600/20 transition-all disabled:opacity-50 cursor-pointer border border-emerald-500"
+                    title="Download complete member attendance CSV spreadsheet"
                   >
                     <Download size={16} />
-                    <span>Download Attendance CSV</span>
+                    <span>Export CSV</span>
                   </button>
                 </div>
               </div>
@@ -2939,16 +2949,16 @@ export default function AdminDashboard() {
                               <td className="p-5 text-right">
                                 <div className="flex items-center justify-end space-x-2">
                                   {/* Quick Present / Absent Toggle Buttons Against Name */}
-                                  <div className="inline-flex items-center bg-gray-100 p-1 rounded-xl space-x-1 shrink-0">
+                                  <div className="inline-flex items-center bg-gray-200/80 p-1 rounded-xl space-x-1.5 shrink-0 border border-gray-300 shadow-xs">
                                     <button
                                       type="button"
                                       disabled={togglingMemberUid === m.uid}
                                       onClick={() => handleInlineToggleAttendance(m, 'present')}
                                       className={cn(
-                                        "px-2.5 py-1.5 rounded-lg text-xs font-black uppercase tracking-wider flex items-center space-x-1 transition-all cursor-pointer",
+                                        "px-3 py-1.5 rounded-lg text-xs font-black uppercase tracking-wider flex items-center space-x-1.5 transition-all cursor-pointer shadow-xs",
                                         isPresentToday
-                                          ? "bg-emerald-600 text-white shadow-sm font-black"
-                                          : "text-gray-600 hover:text-emerald-700 hover:bg-white/80"
+                                          ? "bg-emerald-600 text-white shadow-sm ring-2 ring-emerald-500 font-black"
+                                          : "bg-white text-emerald-800 hover:bg-emerald-50 hover:text-emerald-900 border border-emerald-300 font-bold"
                                       )}
                                       title={`Mark ${m.displayName || 'Member'} as Present for today (${todayDateStr})`}
                                     >
@@ -2961,10 +2971,10 @@ export default function AdminDashboard() {
                                       disabled={togglingMemberUid === m.uid}
                                       onClick={() => handleInlineToggleAttendance(m, 'absent')}
                                       className={cn(
-                                        "px-2.5 py-1.5 rounded-lg text-xs font-black uppercase tracking-wider flex items-center space-x-1 transition-all cursor-pointer",
+                                        "px-3 py-1.5 rounded-lg text-xs font-black uppercase tracking-wider flex items-center space-x-1.5 transition-all cursor-pointer shadow-xs",
                                         !isPresentToday
-                                          ? "bg-rose-600 text-white shadow-sm font-black"
-                                          : "text-gray-600 hover:text-rose-700 hover:bg-white/80"
+                                          ? "bg-rose-600 text-white shadow-sm ring-2 ring-rose-500 font-black"
+                                          : "bg-white text-rose-800 hover:bg-rose-50 hover:text-rose-900 border border-rose-300 font-bold"
                                       )}
                                       title={`Mark ${m.displayName || 'Member'} as Absent for today (${todayDateStr})`}
                                     >
