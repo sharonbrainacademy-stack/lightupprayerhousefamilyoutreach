@@ -259,37 +259,6 @@ export default function Themes() {
             </motion.div>
           ))}
         </div>
-
-        {/* 30-Day Scripture Reading Plan Callout Banner */}
-        <div className="mt-20 bg-gradient-to-r from-[#1A1F3C] via-[#242A52] to-[#1A1F3C] rounded-3xl p-8 sm:p-12 text-white border border-white/10 shadow-2xl relative overflow-hidden">
-          <div className="absolute right-0 top-0 w-96 h-96 bg-[#F26522]/15 rounded-full blur-3xl pointer-events-none" />
-          <div className="relative z-10 flex flex-col lg:flex-row items-center justify-between gap-8">
-            <div className="space-y-4 text-center lg:text-left max-w-2xl">
-              <div className="inline-flex items-center space-x-2 px-3 py-1 bg-[#F26522]/20 text-amber-300 rounded-full text-xs font-black uppercase tracking-wider border border-[#F26522]/30">
-                <Flame size={14} className="fill-current text-[#F26522]" />
-                <span>30-Day Spiritual Journey</span>
-              </div>
-              <h2 className="text-2xl sm:text-4xl font-black uppercase tracking-tight text-white">
-                Take the 30-Day Scripture <br className="hidden sm:inline" />
-                <span className="text-[#F26522]">Reading & Prayer Plan</span>
-              </h2>
-              <p className="text-gray-300 text-sm font-medium leading-relaxed">
-                Complement these weekly themes with a structured day-by-day scripture plan. Track your progress, listen to verses aloud, take personal reflection notes, and build an unshakeable prayer life.
-              </p>
-            </div>
-
-            <div className="flex flex-col sm:flex-row gap-4 shrink-0">
-              <Link
-                to="/reading-plan"
-                className="px-8 py-4 bg-[#F26522] hover:bg-[#d9561a] text-white rounded-2xl font-black text-xs uppercase tracking-widest shadow-xl shadow-[#F26522]/30 flex items-center justify-center space-x-2 transition-all hover:scale-105"
-              >
-                <BookOpen size={16} />
-                <span>Open 30-Day Plan</span>
-                <ArrowRight size={16} />
-              </Link>
-            </div>
-          </div>
-        </div>
       </section>
     </div>
   );

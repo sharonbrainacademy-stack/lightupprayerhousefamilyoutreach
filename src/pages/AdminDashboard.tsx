@@ -14,7 +14,8 @@ import {
   MessageCircle, Share2, Copy, Link as LinkIcon, ExternalLink, Save,
   Smartphone, Wifi, Send, Zap, Image as ImageIcon, Upload, Palette, Sparkles,
   UserPlus, FileSpreadsheet, HandHeart, Eye, EyeOff, ImagePlus,
-  Key, Lock, ClipboardCheck, UserCheck, HeartHandshake, XCircle
+  Key, Lock, ClipboardCheck, UserCheck, HeartHandshake, XCircle,
+  CopyX, GitMerge, Layers, AlertCircle, CheckCheck
 } from 'lucide-react';
 import { collection, onSnapshot, doc, updateDoc, setDoc, addDoc, deleteDoc, serverTimestamp, getDocs, writeBatch, arrayUnion, arrayRemove, increment } from 'firebase/firestore';
 import { useAuth, SUPER_ADMIN_EMAILS } from '../lib/auth';
@@ -179,6 +180,13 @@ export default function AdminDashboard() {
   const [deletingMemberUid, setDeletingMemberUid] = useState<string | null>(null);
   const [memberToDelete, setMemberToDelete] = useState<UserProfile | null>(null);
   const [showBulkDeleteModal, setShowBulkDeleteModal] = useState(false);
+
+  // Automatic Duplicate Detection & Resolution States
+  const [showDuplicateResolutionModal, setShowDuplicateResolutionModal] = useState(false);
+  const [showDeleteAllDuplicatesModal, setShowDeleteAllDuplicatesModal] = useState(false);
+  const [duplicateSelectedPrimaryMap, setDuplicateSelectedPrimaryMap] = useState<Record<string, string>>({});
+  const [duplicateClusterFilter, setDuplicateClusterFilter] = useState<'all' | 'exact_email' | 'phone' | 'name'>('all');
+  const [duplicateActionLoading, setDuplicateActionLoading] = useState<string | null>(null);
 
   // Super Admin helper check
   const isUserSuperAdmin = (u?: UserProfile | null, email?: string | null) => {
@@ -1831,6 +1839,201 @@ export default function AdminDashboard() {
     .filter(m => isSuperAdmin || !isUserSuperAdmin(m));
   const totalLiveInZoomCount = liveGuestsList.length + liveMembersList.length;
 
+  // Master Protected Account Check
+  const isAccountProtected = (m: UserProfile) => {
+    const email = (m.email || '').toLowerCase().trim();
+    return email === 'brainstormacademybsa@gmail.com';
+  };
+
+  // Automatic Duplicate Member Detection Interface & Engine
+  const duplicateMemberClusters = useMemo(() => {
+    // Only evaluate visible candidates (hide super admins if viewer isn't super admin)
+    const candidateMembers = members.filter(m => isSuperAdmin || !isUserSuperAdmin(m));
+
+    const emailMap = new Map<string, UserProfile[]>();
+    const phoneMap = new Map<string, UserProfile[]>();
+    const nameMap = new Map<string, UserProfile[]>();
+
+    candidateMembers.forEach(m => {
+      const email = (m.email || '').toLowerCase().trim();
+      if (email && email.includes('@')) {
+        const list = emailMap.get(email) || [];
+        list.push(m);
+        emailMap.set(email, list);
+      }
+
+      const digits = (m.phone || m.whatsappGroup || '').replace(/\D/g, '');
+      if (digits.length >= 7) {
+        const key = digits.length > 10 ? digits.slice(-10) : digits;
+        const list = phoneMap.get(key) || [];
+        list.push(m);
+        phoneMap.set(key, list);
+      }
+
+      const name = (m.displayName || '').toLowerCase().trim().replace(/\s+/g, ' ');
+      if (name.length >= 3 && name !== 'unnamed member') {
+        const list = nameMap.get(name) || [];
+        list.push(m);
+        nameMap.set(name, list);
+      }
+    });
+
+    // Disjoint set / union find to merge duplicate clusters
+    const parent = new Map<string, string>();
+    const find = (uid: string): string => {
+      if (!parent.has(uid)) parent.set(uid, uid);
+      if (parent.get(uid) !== uid) {
+        parent.set(uid, find(parent.get(uid)!));
+      }
+      return parent.get(uid)!;
+    };
+    const union = (uid1: string, uid2: string) => {
+      const root1 = find(uid1);
+      const root2 = find(uid2);
+      if (root1 !== root2) {
+        parent.set(root1, root2);
+      }
+    };
+
+    emailMap.forEach(list => {
+      if (list.length > 1) {
+        for (let i = 1; i < list.length; i++) union(list[0].uid, list[i].uid);
+      }
+    });
+    phoneMap.forEach(list => {
+      if (list.length > 1) {
+        for (let i = 1; i < list.length; i++) union(list[0].uid, list[i].uid);
+      }
+    });
+    nameMap.forEach(list => {
+      if (list.length > 1) {
+        for (let i = 1; i < list.length; i++) union(list[0].uid, list[i].uid);
+      }
+    });
+
+    const clusterBuckets = new Map<string, UserProfile[]>();
+    candidateMembers.forEach(m => {
+      const root = find(m.uid);
+      const b = clusterBuckets.get(root) || [];
+      b.push(m);
+      clusterBuckets.set(root, b);
+    });
+
+    const clusters: Array<{
+      id: string;
+      matchType: 'email' | 'phone' | 'name';
+      matchValue: string;
+      reason: string;
+      members: UserProfile[];
+      primaryUid: string;
+      redundantUids: string[];
+    }> = [];
+
+    clusterBuckets.forEach((clusterMembers, rootId) => {
+      if (clusterMembers.length <= 1) return;
+
+      const reasons: string[] = [];
+      let matchType: 'email' | 'phone' | 'name' = 'name';
+      let matchVal = '';
+
+      const emails = new Set(clusterMembers.map(m => (m.email || '').toLowerCase().trim()).filter(Boolean));
+      if (emails.size < clusterMembers.length && emails.size > 0) {
+        reasons.push('Exact Email Match');
+        matchType = 'email';
+        matchVal = Array.from(emails)[0];
+      }
+
+      const phones = new Set(clusterMembers.map(m => (m.phone || m.whatsappGroup || '').replace(/\D/g, '')).filter(d => d.length >= 7));
+      if (phones.size < clusterMembers.length && phones.size > 0) {
+        reasons.push('Phone Number Match');
+        if (!matchVal) {
+          matchType = 'phone';
+          matchVal = clusterMembers.find(m => m.phone)?.phone || '';
+        }
+      }
+
+      const names = new Set(clusterMembers.map(m => (m.displayName || '').toLowerCase().trim()).filter(Boolean));
+      if (names.size < clusterMembers.length && names.size > 0) {
+        reasons.push('Identical Full Name');
+        if (!matchVal) {
+          matchType = 'name';
+          matchVal = clusterMembers[0].displayName || '';
+        }
+      }
+
+      if (reasons.length === 0) {
+        reasons.push('Duplicate Member Match');
+      }
+
+      // Rank members to choose the best Primary account to preserve:
+      const sortedByBest = [...clusterMembers].sort((a, b) => {
+        if (isAccountProtected(a)) return -1;
+        if (isAccountProtected(b)) return 1;
+
+        const roleRank = (role?: string) => {
+          if (role === 'super_admin') return 4;
+          if (role === 'admin') return 3;
+          if (role === 'worker') return 2;
+          return 1;
+        };
+        const rDiff = roleRank(b.role) - roleRank(a.role);
+        if (rDiff !== 0) return rDiff;
+
+        const aAtt = (a.attendanceDaysList?.length || a.attendanceCount || 0);
+        const bAtt = (b.attendanceDaysList?.length || b.attendanceCount || 0);
+        if (bAtt !== aAtt) return bAtt - aAtt;
+
+        const aMin = a.totalMinutes || 0;
+        const bMin = b.totalMinutes || 0;
+        if (bMin !== aMin) return bMin - aMin;
+
+        return 0;
+      });
+
+      const chosenPrimary = duplicateSelectedPrimaryMap[rootId] 
+        ? (sortedByBest.find(m => m.uid === duplicateSelectedPrimaryMap[rootId]) || sortedByBest[0])
+        : sortedByBest[0];
+
+      const redundantUids = clusterMembers
+        .filter(m => m.uid !== chosenPrimary.uid)
+        .map(m => m.uid);
+
+      clusters.push({
+        id: rootId,
+        matchType,
+        matchValue: matchVal,
+        reason: reasons.join(' & '),
+        members: sortedByBest,
+        primaryUid: chosenPrimary.uid,
+        redundantUids
+      });
+    });
+
+    return clusters;
+  }, [members, isSuperAdmin, duplicateSelectedPrimaryMap]);
+
+  // Quick duplicate lookups
+  const allRedundantDuplicateUids = useMemo(() => {
+    return duplicateMemberClusters.flatMap(c => c.redundantUids);
+  }, [duplicateMemberClusters]);
+
+  const allDuplicateMemberUids = useMemo(() => {
+    return duplicateMemberClusters.flatMap(c => c.members.map(m => m.uid));
+  }, [duplicateMemberClusters]);
+
+  const duplicateMemberClusterMap = useMemo(() => {
+    const map = new Map<string, { cluster: typeof duplicateMemberClusters[0]; isPrimary: boolean }>();
+    duplicateMemberClusters.forEach(cluster => {
+      cluster.members.forEach(m => {
+        map.set(m.uid, {
+          cluster,
+          isPrimary: m.uid === cluster.primaryUid
+        });
+      });
+    });
+    return map;
+  }, [duplicateMemberClusters]);
+
   // Filtered members: hide super admins if the viewer is not a Super Admin
   const filteredMembers = members.filter((m) => {
     if (!isSuperAdmin && isUserSuperAdmin(m)) {
@@ -1850,6 +2053,8 @@ export default function AdminDashboard() {
     let matchesRole = true;
     if (roleFilter === 'live') {
       matchesRole = isMemberInZoomNow(m);
+    } else if (roleFilter === 'duplicates') {
+      matchesRole = allDuplicateMemberUids.includes(m.uid);
     } else if (roleFilter !== 'all') {
       matchesRole = m.role === roleFilter;
     }
@@ -1919,12 +2124,7 @@ export default function AdminDashboard() {
     document.body.removeChild(link);
   };
 
-  // Member Deletion and Selection Helpers
-  const isAccountProtected = (m: UserProfile) => {
-    const email = (m.email || '').toLowerCase().trim();
-    return email === 'brainstormacademybsa@gmail.com';
-  };
-
+  // Member Selection Helpers
   const handleSelectAllFilteredMembers = () => {
     const selectable = filteredMembers.filter(m => !isAccountProtected(m) && (!user || m.uid !== user.uid));
     if (selectable.length > 0 && selectedMemberUids.length === selectable.length) {
@@ -2025,6 +2225,155 @@ export default function AdminDashboard() {
       });
     } finally {
       setDeletingMemberUid(null);
+    }
+  };
+
+  // Duplicate Resolution & Deletion Handlers
+  const handleDeleteDuplicate = async (targetMember: UserProfile) => {
+    if (isAccountProtected(targetMember)) {
+      setMemberFeedback({
+        type: 'error',
+        message: 'Master administrator accounts are protected and cannot be deleted.'
+      });
+      return;
+    }
+    if (user && user.uid === targetMember.uid) {
+      setMemberFeedback({
+        type: 'error',
+        message: 'You cannot delete your own active administrator account.'
+      });
+      return;
+    }
+
+    setDuplicateActionLoading(targetMember.uid);
+    try {
+      await deleteDoc(doc(db, 'users', targetMember.uid));
+      setSelectedMemberUids(prev => prev.filter(id => id !== targetMember.uid));
+      setMemberFeedback({
+        type: 'success',
+        message: `Deleted duplicate record "${targetMember.displayName || targetMember.email}" successfully.`
+      });
+      setTimeout(() => setMemberFeedback(null), 4000);
+    } catch (err: any) {
+      console.error('Error deleting duplicate:', err);
+      setMemberFeedback({
+        type: 'error',
+        message: `Failed to delete duplicate: ${err?.message || 'Database error'}`
+      });
+    } finally {
+      setDuplicateActionLoading(null);
+    }
+  };
+
+  const handleMergeAndDeleteDuplicate = async (duplicateMember: UserProfile, primaryMember: UserProfile) => {
+    if (isAccountProtected(duplicateMember)) {
+      setMemberFeedback({
+        type: 'error',
+        message: 'Master administrator accounts are protected and cannot be deleted.'
+      });
+      return;
+    }
+    if (duplicateMember.uid === primaryMember.uid) return;
+
+    setDuplicateActionLoading(`merge-${duplicateMember.uid}`);
+    try {
+      const primaryRef = doc(db, 'users', primaryMember.uid);
+      const duplicateRef = doc(db, 'users', duplicateMember.uid);
+
+      // Merge attendance days list
+      const primaryDays = Array.isArray(primaryMember.attendanceDaysList) ? [...primaryMember.attendanceDaysList] : [];
+      const dupDays = Array.isArray(duplicateMember.attendanceDaysList) ? duplicateMember.attendanceDaysList : [];
+      const mergedDays = Array.from(new Set([...primaryDays, ...dupDays]));
+
+      // Merge daily minutes map
+      const mergedDailyMinutes = { ...(primaryMember.dailyMinutes || {}) };
+      if (duplicateMember.dailyMinutes) {
+        Object.entries(duplicateMember.dailyMinutes).forEach(([date, mins]) => {
+          mergedDailyMinutes[date] = Math.max(mergedDailyMinutes[date] || 0, Number(mins) || 0);
+        });
+      }
+
+      const mergedTotalMinutes = (primaryMember.totalMinutes || 0) + (duplicateMember.totalMinutes || 0);
+      const mergedCount = Math.max(mergedDays.length, (primaryMember.attendanceCount || 0) + (duplicateMember.attendanceCount || 0));
+
+      const updates: any = {
+        attendanceDaysList: mergedDays,
+        dailyMinutes: mergedDailyMinutes,
+        totalMinutes: mergedTotalMinutes,
+        attendanceCount: mergedCount,
+        manualAdjustmentNote: `Merged duplicate record (${duplicateMember.email || duplicateMember.uid}) on ${new Date().toLocaleDateString()}`
+      };
+
+      // Fill missing fields on primary if duplicate had them
+      if (!primaryMember.phone && duplicateMember.phone) updates.phone = duplicateMember.phone;
+      if (!primaryMember.country && duplicateMember.country) updates.country = duplicateMember.country;
+      if ((!primaryMember.whatsappCommunity || primaryMember.whatsappCommunity === 'Unassigned') && duplicateMember.whatsappCommunity) {
+        updates.whatsappCommunity = duplicateMember.whatsappCommunity;
+      }
+      if (!primaryMember.whatsappGroup && duplicateMember.whatsappGroup) updates.whatsappGroup = duplicateMember.whatsappGroup;
+
+      const batch = writeBatch(db);
+      batch.update(primaryRef, updates);
+      batch.delete(duplicateRef);
+      await batch.commit();
+
+      setSelectedMemberUids(prev => prev.filter(id => id !== duplicateMember.uid));
+      setMemberFeedback({
+        type: 'success',
+        message: `Successfully merged attendance history from "${duplicateMember.displayName || duplicateMember.email}" into "${primaryMember.displayName || primaryMember.email}" and removed the duplicate.`
+      });
+      setTimeout(() => setMemberFeedback(null), 5000);
+    } catch (err: any) {
+      console.error('Error merging duplicate:', err);
+      setMemberFeedback({
+        type: 'error',
+        message: `Failed to merge duplicate: ${err?.message || 'Database error'}`
+      });
+    } finally {
+      setDuplicateActionLoading(null);
+    }
+  };
+
+  const handleDeleteAllRedundantDuplicates = async () => {
+    if (allRedundantDuplicateUids.length === 0) return;
+
+    setDuplicateActionLoading('all-redundant');
+    try {
+      const batch = writeBatch(db);
+      let deletedCount = 0;
+
+      for (const uid of allRedundantDuplicateUids) {
+        const mem = members.find(m => m.uid === uid);
+        if (mem && !isAccountProtected(mem) && (!user || mem.uid !== user.uid)) {
+          batch.delete(doc(db, 'users', uid));
+          deletedCount++;
+        }
+      }
+
+      if (deletedCount > 0) {
+        await batch.commit();
+        setSelectedMemberUids(prev => prev.filter(id => !allRedundantDuplicateUids.includes(id)));
+        setMemberFeedback({
+          type: 'success',
+          message: `Successfully deleted all ${deletedCount} redundant duplicate member accounts!`
+        });
+      } else {
+        setMemberFeedback({
+          type: 'error',
+          message: 'No eligible redundant duplicate accounts could be deleted.'
+        });
+      }
+      setShowDeleteAllDuplicatesModal(false);
+      setShowDuplicateResolutionModal(false);
+      setTimeout(() => setMemberFeedback(null), 5000);
+    } catch (err: any) {
+      console.error('Error deleting all duplicates:', err);
+      setMemberFeedback({
+        type: 'error',
+        message: `Failed to delete duplicates: ${err?.message || 'Database error'}`
+      });
+    } finally {
+      setDuplicateActionLoading(null);
     }
   };
 
@@ -2502,7 +2851,7 @@ export default function AdminDashboard() {
                 </div>
 
                 {/* Visible Command Action Bar - Guaranteed 100% visible and responsive */}
-                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3 pt-2 border-t border-gray-100">
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6 gap-3 pt-2 border-t border-gray-100">
                   <button
                     onClick={() => {
                       setAttendanceReportInitialSubTab('reports');
@@ -2525,6 +2874,15 @@ export default function AdminDashboard() {
                   >
                     <HeartHandshake size={16} />
                     <span>Absent Follow-Up</span>
+                  </button>
+
+                  <button
+                    onClick={() => setShowLiveRosterModal(true)}
+                    className="flex items-center justify-center space-x-2 px-4 py-3 bg-emerald-700 hover:bg-emerald-800 text-white rounded-xl font-black uppercase tracking-wider text-xs shadow-md shadow-emerald-700/30 transition-all cursor-pointer border border-emerald-600"
+                    title="View live roster of participants praying in Zoom right now"
+                  >
+                    <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+                    <span>Live Zoom ({totalLiveInZoomCount})</span>
                   </button>
 
                   <button
@@ -2656,6 +3014,60 @@ export default function AdminDashboard() {
                 </div>
               )}
 
+              {/* Automatic Duplicate Member Entries Detection Alert Banner */}
+              {duplicateMemberClusters.length > 0 && (
+                <div className="bg-amber-50 border-2 border-amber-300 rounded-3xl p-5 sm:p-6 flex flex-col md:flex-row items-start md:items-center justify-between gap-4 shadow-sm animate-in fade-in slide-in-from-top-2">
+                  <div className="flex items-start space-x-3.5">
+                    <div className="w-10 h-10 rounded-2xl bg-amber-500 text-white flex items-center justify-center shrink-0 shadow-sm mt-0.5">
+                      <CopyX size={20} />
+                    </div>
+                    <div>
+                      <div className="flex items-center space-x-2">
+                        <h4 className="text-base font-black text-[#1A1F3C]">
+                          Automatic Duplicate Member Detection ({duplicateMemberClusters.length} Cluster{duplicateMemberClusters.length > 1 ? 's' : ''})
+                        </h4>
+                        <span className="px-2.5 py-0.5 bg-rose-100 text-rose-800 text-[10px] font-black uppercase rounded-full">
+                          {allRedundantDuplicateUids.length} Redundant Account{allRedundantDuplicateUids.length > 1 ? 's' : ''} Found
+                        </span>
+                      </div>
+                      <p className="text-xs text-amber-900/80 mt-1 font-medium leading-relaxed">
+                        We detected duplicate registered members sharing exact emails, phone numbers, or full names. You can inspect side-by-side comparisons, merge prayer records, or delete redundant duplicates in one click.
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-2.5 shrink-0 w-full md:w-auto">
+                    <button
+                      onClick={() => setShowDuplicateResolutionModal(true)}
+                      className="flex-1 md:flex-initial px-4 py-2.5 bg-[#1A1F3C] hover:bg-[#282E5C] text-white rounded-xl text-xs font-black uppercase tracking-wider flex items-center justify-center space-x-2 shadow-sm transition-all cursor-pointer"
+                    >
+                      <Layers size={15} className="text-amber-400" />
+                      <span>Review & Resolve</span>
+                    </button>
+
+                    <button
+                      onClick={() => setShowDeleteAllDuplicatesModal(true)}
+                      className="flex-1 md:flex-initial px-4 py-2.5 bg-rose-600 hover:bg-rose-700 text-white rounded-xl text-xs font-black uppercase tracking-wider flex items-center justify-center space-x-2 shadow-sm transition-all cursor-pointer"
+                    >
+                      <Trash2 size={15} />
+                      <span>Delete All Duplicates ({allRedundantDuplicateUids.length})</span>
+                    </button>
+
+                    <button
+                      onClick={() => setRoleFilter(roleFilter === 'duplicates' ? 'all' : 'duplicates')}
+                      className={cn(
+                        "px-3 py-2.5 rounded-xl text-xs font-black uppercase tracking-wider flex items-center justify-center space-x-1.5 transition-all cursor-pointer border",
+                        roleFilter === 'duplicates'
+                          ? "bg-amber-600 text-white border-amber-600 shadow-sm"
+                          : "bg-white text-amber-800 border-amber-300 hover:bg-amber-100"
+                      )}
+                    >
+                      <span>{roleFilter === 'duplicates' ? 'Show All Members' : 'Filter Duplicates in Table'}</span>
+                    </button>
+                  </div>
+                </div>
+              )}
+
               {/* Bulk Action Toolbar */}
               {selectedMemberUids.length > 0 && (
                 <div className="bg-[#1A1F3C] text-white p-4 rounded-2xl flex flex-wrap items-center justify-between gap-4 shadow-lg animate-in fade-in slide-in-from-top-2">
@@ -2724,6 +3136,20 @@ export default function AdminDashboard() {
                     <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
                     <span>Live in Zoom ({liveMembersList.length})</span>
                   </button>
+                  {duplicateMemberClusters.length > 0 && (
+                    <button
+                      onClick={() => setRoleFilter(roleFilter === 'duplicates' ? 'all' : 'duplicates')}
+                      className={cn(
+                        "px-4 py-2 rounded-xl text-xs font-bold transition-all cursor-pointer flex items-center space-x-1.5 border",
+                        roleFilter === 'duplicates' 
+                          ? "bg-amber-600 text-white border-amber-600 shadow-sm" 
+                          : "bg-amber-50 text-amber-800 hover:bg-amber-100 border-amber-300"
+                      )}
+                    >
+                      <CopyX size={13} className={roleFilter === 'duplicates' ? 'text-white' : 'text-amber-600'} />
+                      <span>Duplicates ({allRedundantDuplicateUids.length})</span>
+                    </button>
+                  )}
                   <select 
                     value={communityFilter}
                     onChange={(e) => setCommunityFilter(e.target.value)}
@@ -2803,6 +3229,8 @@ export default function AdminDashboard() {
                           const isProtected = isAccountProtected(m);
                           const isSelf = user?.uid === m.uid;
                           const isSelected = selectedMemberUids.includes(m.uid);
+                          const duplicateInfo = duplicateMemberClusterMap.get(m.uid);
+                          const isRedundantDuplicate = Boolean(duplicateInfo && !duplicateInfo.isPrimary);
                           const canDelete = !isProtected && !isSelf && (isSuperAdmin || m.role === 'member');
                           const isPresentToday = Boolean(
                             (Array.isArray(m.attendanceDaysList) && m.attendanceDaysList.includes(todayDateStr)) ||
@@ -2810,7 +3238,7 @@ export default function AdminDashboard() {
                           );
 
                           return (
-                            <tr key={m.uid} className={cn("transition-colors", isSelected ? "bg-orange-50/40" : (isLiveNow ? "bg-emerald-50/40 hover:bg-emerald-50/70" : "hover:bg-gray-50/50"))}>
+                            <tr key={m.uid} className={cn("transition-colors", isSelected ? "bg-orange-50/40" : (isRedundantDuplicate ? "bg-amber-50/50 hover:bg-amber-100/50" : (isLiveNow ? "bg-emerald-50/40 hover:bg-emerald-50/70" : "hover:bg-gray-50/50")))}>
                               <td className="p-4 text-center">
                                 <input 
                                   type="checkbox"
@@ -2827,7 +3255,7 @@ export default function AdminDashboard() {
                                 <div className="flex items-center space-x-3">
                                   <div className={cn(
                                     "w-10 h-10 rounded-full font-black flex items-center justify-center text-xs uppercase shrink-0",
-                                    isLiveNow ? "bg-emerald-600 text-white ring-2 ring-emerald-400 animate-pulse" : "bg-[#1A1F3C] text-white"
+                                    isLiveNow ? "bg-emerald-600 text-white ring-2 ring-emerald-400 animate-pulse" : (isRedundantDuplicate ? "bg-amber-600 text-white" : "bg-[#1A1F3C] text-white")
                                   )}>
                                     {(m.displayName || m.email || 'M').charAt(0)}
                                   </div>
@@ -2846,6 +3274,21 @@ export default function AdminDashboard() {
                                       )}
                                     </div>
                                     <p className="text-[10px] font-mono text-gray-400">{m.email}</p>
+                                    {duplicateInfo && (
+                                      <div className="mt-1">
+                                        {duplicateInfo.isPrimary ? (
+                                          <span className="inline-flex items-center space-x-1 px-2 py-0.5 bg-emerald-100 text-emerald-800 text-[9px] font-black rounded-md border border-emerald-200">
+                                            <CheckCheck size={11} className="text-emerald-700" />
+                                            <span>Primary Record (Keep)</span>
+                                          </span>
+                                        ) : (
+                                          <span className="inline-flex items-center space-x-1 px-2 py-0.5 bg-rose-100 text-rose-900 text-[9px] font-black rounded-md border border-rose-300">
+                                            <CopyX size={11} className="text-rose-700" />
+                                            <span>Duplicate ({duplicateInfo.cluster.reason})</span>
+                                          </span>
+                                        )}
+                                      </div>
+                                    )}
                                     {(m.phone || (m.whatsappGroup && m.whatsappGroup.replace(/\D/g, '').length >= 7)) && (() => {
                                       const rawPhone = m.phone || m.whatsappGroup || '';
                                       const cleanDigits = rawPhone.replace(/\D/g, '');
@@ -2982,6 +3425,24 @@ export default function AdminDashboard() {
                                       <span>Absent</span>
                                     </button>
                                   </div>
+
+                                  {/* Direct Delete Duplicate Button for Redundant Duplicates */}
+                                  {duplicateInfo && !duplicateInfo.isPrimary && canDelete && (
+                                    <button
+                                      type="button"
+                                      onClick={() => handleDeleteDuplicate(m)}
+                                      disabled={duplicateActionLoading === m.uid}
+                                      className="px-3 py-1.5 bg-rose-600 hover:bg-rose-700 text-white rounded-xl text-xs font-black uppercase tracking-wider flex items-center space-x-1.5 shadow-sm transition-all cursor-pointer shrink-0"
+                                      title="Permanently delete this redundant duplicate member entry from database"
+                                    >
+                                      {duplicateActionLoading === m.uid ? (
+                                        <RefreshCw size={12} className="animate-spin" />
+                                      ) : (
+                                        <Trash2 size={12} />
+                                      )}
+                                      <span>Delete Duplicate</span>
+                                    </button>
+                                  )}
 
                                   <button
                                     onClick={() => setMemberToDelete(m)}
@@ -3137,6 +3598,337 @@ export default function AdminDashboard() {
                           <>
                             <Trash2 size={14} />
                             <span>Delete All {selectedMemberUids.length}</span>
+                          </>
+                        )}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* DUPLICATE RESOLUTION & CLEANUP CENTER MODAL */}
+              {showDuplicateResolutionModal && (
+                <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-6 bg-black/80 backdrop-blur-md animate-in fade-in duration-200 overflow-y-auto">
+                  <div className="bg-white w-full max-w-5xl rounded-3xl p-5 sm:p-8 space-y-6 shadow-2xl border border-gray-100 my-8 max-h-[90vh] flex flex-col">
+                    {/* Modal Header */}
+                    <div className="flex items-start justify-between border-b border-gray-100 pb-5 shrink-0">
+                      <div className="flex items-center space-x-3.5">
+                        <div className="w-12 h-12 rounded-2xl bg-amber-500 text-white flex items-center justify-center shrink-0 shadow-md">
+                          <CopyX size={24} />
+                        </div>
+                        <div>
+                          <div className="flex items-center space-x-2">
+                            <h3 className="text-xl sm:text-2xl font-black text-[#1A1F3C]">Duplicate Resolution & Cleanup Center</h3>
+                            <span className="px-2.5 py-0.5 bg-rose-100 text-rose-800 text-xs font-black uppercase rounded-full">
+                              {allRedundantDuplicateUids.length} Duplicates Available for Deletion
+                            </span>
+                          </div>
+                          <p className="text-gray-500 text-xs font-medium mt-1">
+                            Review duplicate accounts side-by-side. Choose the Primary record to keep, merge prayer logs, or delete duplicates immediately.
+                          </p>
+                        </div>
+                      </div>
+
+                      <button
+                        onClick={() => setShowDuplicateResolutionModal(false)}
+                        className="p-2 text-gray-400 hover:text-[#1A1F3C] hover:bg-gray-100 rounded-xl transition-all cursor-pointer"
+                      >
+                        <X size={20} />
+                      </button>
+                    </div>
+
+                    {/* Filter Pills */}
+                    <div className="flex flex-wrap items-center gap-2 shrink-0">
+                      <span className="text-xs font-black uppercase text-gray-400 mr-2">Filter Match Type:</span>
+                      <button
+                        onClick={() => setDuplicateClusterFilter('all')}
+                        className={cn(
+                          "px-3 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer",
+                          duplicateClusterFilter === 'all' ? "bg-[#1A1F3C] text-white shadow-xs" : "bg-gray-100 text-gray-600 hover:bg-gray-200"
+                        )}
+                      >
+                        All Clusters ({duplicateMemberClusters.length})
+                      </button>
+                      <button
+                        onClick={() => setDuplicateClusterFilter('exact_email')}
+                        className={cn(
+                          "px-3 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer",
+                          duplicateClusterFilter === 'exact_email' ? "bg-amber-600 text-white shadow-xs" : "bg-gray-100 text-gray-600 hover:bg-gray-200"
+                        )}
+                      >
+                        Email Matches ({duplicateMemberClusters.filter(c => c.reason.includes('Email')).length})
+                      </button>
+                      <button
+                        onClick={() => setDuplicateClusterFilter('phone')}
+                        className={cn(
+                          "px-3 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer",
+                          duplicateClusterFilter === 'phone' ? "bg-amber-600 text-white shadow-xs" : "bg-gray-100 text-gray-600 hover:bg-gray-200"
+                        )}
+                      >
+                        Phone Matches ({duplicateMemberClusters.filter(c => c.reason.includes('Phone')).length})
+                      </button>
+                      <button
+                        onClick={() => setDuplicateClusterFilter('name')}
+                        className={cn(
+                          "px-3 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer",
+                          duplicateClusterFilter === 'name' ? "bg-amber-600 text-white shadow-xs" : "bg-gray-100 text-gray-600 hover:bg-gray-200"
+                        )}
+                      >
+                        Name Matches ({duplicateMemberClusters.filter(c => c.reason.includes('Name')).length})
+                      </button>
+                    </div>
+
+                    {/* Scrollable Cluster Cards */}
+                    <div className="space-y-6 overflow-y-auto pr-1 flex-1">
+                      {duplicateMemberClusters
+                        .filter(c => {
+                          if (duplicateClusterFilter === 'exact_email') return c.reason.includes('Email');
+                          if (duplicateClusterFilter === 'phone') return c.reason.includes('Phone');
+                          if (duplicateClusterFilter === 'name') return c.reason.includes('Name');
+                          return true;
+                        })
+                        .map((cluster, cIdx) => (
+                          <div key={cluster.id} className="bg-gray-50/80 border border-amber-200/80 rounded-3xl p-5 space-y-4 shadow-xs">
+                            {/* Cluster Header */}
+                            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-gray-200/70 pb-3">
+                              <div className="flex items-center space-x-2.5">
+                                <span className="px-2.5 py-1 bg-[#1A1F3C] text-white text-[11px] font-black uppercase rounded-lg">
+                                  Cluster #{cIdx + 1}
+                                </span>
+                                <span className="px-2.5 py-1 bg-amber-100 text-amber-900 border border-amber-300 text-[11px] font-bold rounded-lg flex items-center space-x-1">
+                                  <AlertCircle size={12} className="text-amber-700" />
+                                  <span>{cluster.reason}</span>
+                                </span>
+                                {cluster.matchValue && (
+                                  <span className="text-xs text-gray-500 font-mono font-medium hidden sm:inline">
+                                    "{cluster.matchValue}"
+                                  </span>
+                                )}
+                              </div>
+
+                              <div className="text-xs font-bold text-gray-500">
+                                {cluster.members.length} Accounts ({cluster.redundantUids.length} to delete)
+                              </div>
+                            </div>
+
+                            {/* Side-by-Side Member Comparison Grid */}
+                            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                              {cluster.members.map((mem) => {
+                                const isPrimary = mem.uid === cluster.primaryUid;
+                                const isProtected = isAccountProtected(mem);
+                                const isSelf = user?.uid === mem.uid;
+                                const canDelete = !isProtected && !isSelf && (isSuperAdmin || mem.role === 'member');
+                                const daysCount = mem.attendanceCount || (mem.attendanceDaysList?.length || 0);
+                                const totalMins = mem.totalMinutes || 0;
+                                const primaryMemberObj = cluster.members.find(m => m.uid === cluster.primaryUid) || cluster.members[0];
+
+                                return (
+                                  <div
+                                    key={mem.uid}
+                                    className={cn(
+                                      "p-4 rounded-2xl border-2 transition-all flex flex-col justify-between space-y-3",
+                                      isPrimary
+                                        ? "bg-white border-emerald-500 shadow-md ring-2 ring-emerald-400/20"
+                                        : "bg-white/80 border-gray-200 hover:border-amber-300"
+                                    )}
+                                  >
+                                    <div className="space-y-3">
+                                      {/* Header with Radio to select Primary */}
+                                      <div className="flex items-start justify-between gap-2">
+                                        <label 
+                                          className="flex items-center space-x-2 cursor-pointer"
+                                          onClick={() => {
+                                            setDuplicateSelectedPrimaryMap(prev => ({ ...prev, [cluster.id]: mem.uid }));
+                                          }}
+                                        >
+                                          <input
+                                            type="radio"
+                                            name={`primary-${cluster.id}`}
+                                            checked={isPrimary}
+                                            onChange={() => {
+                                              setDuplicateSelectedPrimaryMap(prev => ({ ...prev, [cluster.id]: mem.uid }));
+                                            }}
+                                            className="w-4 h-4 text-emerald-600 focus:ring-emerald-500 cursor-pointer"
+                                          />
+                                          <span className={cn(
+                                            "text-xs font-black uppercase tracking-wider",
+                                            isPrimary ? "text-emerald-700" : "text-gray-600 hover:text-black"
+                                          )}>
+                                            {isPrimary ? '👑 Keep as Primary' : 'Set as Primary'}
+                                          </span>
+                                        </label>
+
+                                        {isProtected && (
+                                          <span className="px-1.5 py-0.5 bg-amber-100 text-amber-800 text-[9px] font-black uppercase rounded">
+                                            Master
+                                          </span>
+                                        )}
+                                      </div>
+
+                                      {/* Member info */}
+                                      <div className="space-y-1">
+                                        <p className="font-black text-sm text-[#1A1F3C] leading-snug">{mem.displayName || 'Unnamed Member'}</p>
+                                        <p className="text-xs font-mono text-gray-500 truncate" title={mem.email}>{mem.email || 'No email'}</p>
+                                        {mem.phone && (
+                                          <p className="text-xs font-mono text-emerald-700 font-bold flex items-center space-x-1">
+                                            <Phone size={11} />
+                                            <span>{mem.phone}</span>
+                                          </p>
+                                        )}
+                                        <div className="pt-1 flex flex-wrap gap-1">
+                                          <span className="px-2 py-0.5 bg-gray-100 text-gray-700 text-[10px] font-bold rounded">
+                                            Role: {mem.role || 'member'}
+                                          </span>
+                                          <span className="px-2 py-0.5 bg-emerald-50 text-emerald-800 text-[10px] font-bold rounded">
+                                            {getMemberWhatsAppCommunity(mem)}
+                                          </span>
+                                        </div>
+                                      </div>
+
+                                      {/* Attendance snapshot */}
+                                      <div className="grid grid-cols-2 gap-2 bg-gray-50 p-2.5 rounded-xl text-center border border-gray-100">
+                                        <div>
+                                          <span className="text-[9px] font-black uppercase text-gray-400 block">Attendance</span>
+                                          <span className="font-black text-xs text-emerald-700">{daysCount} Days</span>
+                                        </div>
+                                        <div>
+                                          <span className="text-[9px] font-black uppercase text-gray-400 block">Prayer Time</span>
+                                          <span className="font-black text-xs text-[#F26522]">{formatMinutesToHours(totalMins)}</span>
+                                        </div>
+                                      </div>
+                                    </div>
+
+                                    {/* Action buttons for redundant records */}
+                                    {!isPrimary && (
+                                      <div className="space-y-1.5 pt-2 border-t border-gray-100">
+                                        <button
+                                          type="button"
+                                          disabled={!canDelete || duplicateActionLoading === mem.uid}
+                                          onClick={() => handleDeleteDuplicate(mem)}
+                                          className="w-full py-2 bg-rose-600 hover:bg-rose-700 text-white rounded-xl text-xs font-black uppercase tracking-wider flex items-center justify-center space-x-1.5 shadow-sm transition-all cursor-pointer disabled:opacity-50"
+                                          title="Delete this redundant duplicate record directly from database"
+                                        >
+                                          {duplicateActionLoading === mem.uid ? (
+                                            <RefreshCw size={12} className="animate-spin" />
+                                          ) : (
+                                            <Trash2 size={12} />
+                                          )}
+                                          <span>Delete Duplicate</span>
+                                        </button>
+
+                                        <button
+                                          type="button"
+                                          disabled={!canDelete || duplicateActionLoading === `merge-${mem.uid}`}
+                                          onClick={() => handleMergeAndDeleteDuplicate(mem, primaryMemberObj)}
+                                          className="w-full py-2 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 rounded-xl text-xs font-black uppercase tracking-wider flex items-center justify-center space-x-1.5 transition-all cursor-pointer disabled:opacity-50"
+                                          title="Transfer attendance days & minutes to primary account, then delete duplicate"
+                                        >
+                                          {duplicateActionLoading === `merge-${mem.uid}` ? (
+                                            <RefreshCw size={12} className="animate-spin" />
+                                          ) : (
+                                            <GitMerge size={12} />
+                                          )}
+                                          <span>Merge & Delete</span>
+                                        </button>
+                                      </div>
+                                    )}
+
+                                    {isPrimary && (
+                                      <div className="pt-2 border-t border-emerald-100 text-center">
+                                        <span className="text-[11px] font-black text-emerald-700 uppercase flex items-center justify-center space-x-1">
+                                          <CheckCheck size={14} />
+                                          <span>Preserved Master Profile</span>
+                                        </span>
+                                      </div>
+                                    )}
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          </div>
+                        ))}
+                    </div>
+
+                    {/* Modal Footer */}
+                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-t border-gray-100 pt-5 shrink-0">
+                      <div className="text-xs text-gray-500 font-medium">
+                        Showing <strong className="text-[#1A1F3C] font-black">{duplicateMemberClusters.length} duplicate clusters</strong> containing <strong className="text-rose-600 font-black">{allRedundantDuplicateUids.length} redundant accounts</strong> available for deletion.
+                      </div>
+
+                      <div className="flex items-center space-x-3">
+                        <button
+                          type="button"
+                          onClick={() => setShowDeleteAllDuplicatesModal(true)}
+                          disabled={allRedundantDuplicateUids.length === 0 || duplicateActionLoading === 'all-redundant'}
+                          className="px-5 py-2.5 bg-rose-600 hover:bg-rose-700 text-white rounded-xl text-xs font-black uppercase tracking-wider flex items-center space-x-1.5 shadow-md shadow-rose-600/30 transition-all cursor-pointer disabled:opacity-50"
+                        >
+                          <Trash2 size={14} />
+                          <span>Delete All {allRedundantDuplicateUids.length} Duplicates</span>
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={() => setShowDuplicateResolutionModal(false)}
+                          className="px-5 py-2.5 bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-xl text-xs font-bold transition-all cursor-pointer"
+                        >
+                          Close / Done
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* DELETE ALL DUPLICATES CONFIRMATION MODAL */}
+              {showDeleteAllDuplicatesModal && (
+                <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/75 backdrop-blur-sm animate-in fade-in duration-200">
+                  <div className="bg-white w-full max-w-md rounded-3xl p-6 md:p-8 space-y-6 shadow-2xl border border-gray-100 animate-in zoom-in-95 duration-200">
+                    <div className="w-14 h-14 rounded-2xl bg-rose-50 border border-rose-100 text-rose-600 flex items-center justify-center mx-auto">
+                      <CopyX size={28} />
+                    </div>
+
+                    <div className="text-center space-y-2">
+                      <h3 className="text-xl font-black text-[#1A1F3C]">Delete All {allRedundantDuplicateUids.length} Redundant Duplicates?</h3>
+                      <p className="text-gray-500 text-xs font-medium leading-relaxed">
+                        This action will permanently delete <span className="font-bold text-rose-600">{allRedundantDuplicateUids.length} redundant duplicate accounts</span> across all {duplicateMemberClusters.length} detected clusters.
+                      </p>
+                    </div>
+
+                    <div className="p-3.5 bg-amber-50 rounded-2xl border border-amber-200 text-xs text-amber-900 font-medium space-y-1">
+                      <p className="font-bold flex items-center space-x-1 text-amber-950">
+                        <CheckCheck size={14} className="text-emerald-600" />
+                        <span>Preserved Records:</span>
+                      </p>
+                      <p className="text-[11px] text-amber-800">
+                        All primary member records, master administrator accounts, and historical attendance logs are safeguarded.
+                      </p>
+                    </div>
+
+                    <div className="flex items-center space-x-3 pt-2">
+                      <button
+                        type="button"
+                        onClick={() => setShowDeleteAllDuplicatesModal(false)}
+                        disabled={duplicateActionLoading === 'all-redundant'}
+                        className="flex-1 px-5 py-3 bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-xl text-xs font-bold transition-all cursor-pointer"
+                      >
+                        Cancel
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={handleDeleteAllRedundantDuplicates}
+                        disabled={duplicateActionLoading === 'all-redundant'}
+                        className="flex-1 px-5 py-3 bg-rose-600 hover:bg-rose-700 text-white rounded-xl text-xs font-black uppercase tracking-wider transition-all flex items-center justify-center space-x-2 shadow-lg shadow-rose-600/30 cursor-pointer disabled:opacity-50"
+                      >
+                        {duplicateActionLoading === 'all-redundant' ? (
+                          <>
+                            <RefreshCw size={14} className="animate-spin" />
+                            <span>Deleting Duplicates...</span>
+                          </>
+                        ) : (
+                          <>
+                            <Trash2 size={14} />
+                            <span>Confirm & Delete</span>
                           </>
                         )}
                       </button>

@@ -734,28 +734,6 @@ export default function Media() {
               <p className="text-gray-500 font-medium">Free spiritual materials for your growth.</p>
             </div>
             <div className="space-y-4">
-              <Link 
-                to="/reading-plan"
-                className="bg-white p-5 rounded-2xl flex items-center justify-between group hover:border-[#F26522] border border-[#F26522]/30 transition-all shadow-sm block bg-gradient-to-r from-orange-50/50 to-white"
-              >
-                <div className="flex items-center space-x-4">
-                  <div className="bg-[#F26522]/10 p-3 rounded-lg text-[#F26522]">
-                    <BookOpen size={20} />
-                  </div>
-                  <div>
-                    <div className="flex items-center space-x-2">
-                      <p className="font-black text-[#1A1F3C] text-sm group-hover:text-[#F26522] transition-colors">30-Day Scripture Reading Plan</p>
-                      <span className="px-2 py-0.5 bg-[#F26522] text-white text-[9px] font-black uppercase rounded-full">Interactive</span>
-                    </div>
-                    <p className="text-[10px] text-gray-500 uppercase tracking-widest font-bold">Track progress • Audio Narration • Daily Prayers</p>
-                  </div>
-                </div>
-                <div className="text-[#F26522] flex items-center space-x-1 text-xs font-black uppercase tracking-wider">
-                  <span>Open Plan</span>
-                  <ArrowRight size={16} />
-                </div>
-              </Link>
-
               {[
                 { name: "Weekly Prayer Point PDF", size: "2.4 MB" },
                 { name: "The Assignment Theme Flyer", size: "5.8 MB" },

@@ -20,8 +20,8 @@ import Outreach from './pages/Outreach';
 import Media from './pages/Media';
 import Join from './pages/Join';
 import Contact from './pages/Contact';
-import ReadingPlan from './pages/ReadingPlan';
 import AdminDashboard from './pages/AdminDashboard';
+import { Navigate } from 'react-router-dom';
 
 export default function App() {
   useEffect(() => {
@@ -45,8 +45,8 @@ export default function App() {
                   <Route path="/beliefs" element={<Believe />} />
                   <Route path="/schedule" element={<Schedule />} />
                   <Route path="/themes" element={<Themes />} />
-                  <Route path="/reading-plan" element={<ReadingPlan />} />
-                  <Route path="/scriptures" element={<ReadingPlan />} />
+                  <Route path="/reading-plan" element={<Navigate to="/" replace />} />
+                  <Route path="/scriptures" element={<Navigate to="/" replace />} />
                   <Route path="/outreach" element={<Outreach />} />
                   <Route path="/media" element={<Media />} />
                   <Route path="/join" element={<Join />} />

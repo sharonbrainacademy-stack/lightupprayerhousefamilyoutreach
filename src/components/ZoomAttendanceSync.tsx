@@ -10,7 +10,8 @@ import {
   Search, Plus, Check, X, Filter, Calendar, 
   ExternalLink, ArrowRight, Video, Sparkles, FileSpreadsheet, Eye, MessageCircle,
   FileCode2, ClipboardPaste, ChevronLeft, ChevronRight, UserCheck, RotateCcw,
-  Edit3, Sliders, UserX, ArrowUpRight, CheckSquare, XCircle, HeartHandshake
+  Edit3, Sliders, UserX, ArrowUpRight, CheckSquare, XCircle, HeartHandshake,
+  CopyX, GitMerge, Layers
 } from 'lucide-react';
 import { collection, onSnapshot, doc, updateDoc, setDoc, addDoc, deleteDoc, serverTimestamp, getDocs, writeBatch, query, where, orderBy, limit, arrayRemove, arrayUnion, increment } from 'firebase/firestore';
 import { db } from '../lib/firebase';
@@ -848,6 +849,14 @@ export default function ZoomAttendanceSync({ members, onRefreshMembers, onNaviga
         });
       });
 
+      // Strictly report matched members first before guests, both alphabetically
+      processed.sort((a, b) => {
+        if (a.status !== b.status) {
+          return a.status === 'matched' ? -1 : 1;
+        }
+        return (a.name || '').localeCompare(b.name || '', undefined, { sensitivity: 'base' });
+      });
+
       setParsedRows(processed);
       setSyncSuccessMsg(`✅ Successfully processed ${processed.length} participants from ${sourceName} (Date: ${detectedDate || getTodayDateString()}). Click "Sync Attendance to Database" below to credit attendance.`);
     } catch (err: any) {
@@ -1172,12 +1181,14 @@ export default function ZoomAttendanceSync({ members, onRefreshMembers, onNaviga
         });
       }
 
-      // Sort: Present members first (alphabetical), then Absent members (alphabetical)
+      // Sort: Match/Present members first (alphabetical A-Z), then Absent members (alphabetical A-Z)
       createdLogs.sort((a, b) => {
-        if (a.status !== b.status) {
-          return a.status === 'present' ? -1 : 1;
+        const aPresent = a.status === 'present';
+        const bPresent = b.status === 'present';
+        if (aPresent !== bPresent) {
+          return aPresent ? -1 : 1;
         }
-        return a.name.localeCompare(b.name, undefined, { sensitivity: 'base' });
+        return (a.name || '').localeCompare(b.name || '', undefined, { sensitivity: 'base' });
       });
 
       const todayBadge = isToday ? "Today's Attendance" : `Session Date: ${meetingDate}`;
@@ -1822,15 +1833,113 @@ export default function ZoomAttendanceSync({ members, onRefreshMembers, onNaviga
     document.body.removeChild(link);
   };
 
+  // Automatic Duplicate Attendees Detection in Uploaded Zoom file
+  const duplicateParsedRowsMap = useMemo(() => {
+    const nameMap = new Map<string, ParsedParticipantRow[]>();
+    const emailMap = new Map<string, ParsedParticipantRow[]>();
+
+    parsedRows.forEach(row => {
+      const n = (row.name || '').toLowerCase().trim().replace(/\s+/g, ' ');
+      if (n.length >= 3) {
+        const list = nameMap.get(n) || [];
+        list.push(row);
+        nameMap.set(n, list);
+      }
+      const e = (row.email || '').toLowerCase().trim();
+      if (e && e.includes('@')) {
+        const list = emailMap.get(e) || [];
+        list.push(row);
+        emailMap.set(e, list);
+      }
+    });
+
+    const dupRowIds = new Set<string>();
+    nameMap.forEach(list => {
+      if (list.length > 1) list.forEach(r => dupRowIds.add(r.id));
+    });
+    emailMap.forEach(list => {
+      if (list.length > 1) list.forEach(r => dupRowIds.add(r.id));
+    });
+
+    return dupRowIds;
+  }, [parsedRows]);
+
+  // Handler to automatically merge duplicate reconnects in parsedRows
+  const handleMergeDuplicateParsedRows = () => {
+    const grouped = new Map<string, ParsedParticipantRow>();
+    
+    parsedRows.forEach(row => {
+      const key = (row.email && row.email.includes('@'))
+        ? row.email.toLowerCase().trim()
+        : (row.name || '').toLowerCase().trim().replace(/\s+/g, ' ');
+
+      if (grouped.has(key)) {
+        const existing = grouped.get(key)!;
+        grouped.set(key, {
+          ...existing,
+          durationMinutes: existing.durationMinutes + row.durationMinutes,
+          status: (existing.status === 'matched' || row.status === 'matched') ? 'matched' : existing.status,
+          matchedMember: existing.matchedMember || row.matchedMember,
+          whatsappCommunity: existing.whatsappCommunity !== 'Unassigned' ? existing.whatsappCommunity : row.whatsappCommunity
+        });
+      } else {
+        grouped.set(key, { ...row });
+      }
+    });
+
+    const mergedList = Array.from(grouped.values());
+    const countRemoved = parsedRows.length - mergedList.length;
+    setParsedRows(mergedList);
+    setSyncSuccessMsg(`Consolidated duplicate attendees: merged prayer minutes for reconnects and removed ${countRemoved} redundant row(s).`);
+    setTimeout(() => setSyncSuccessMsg(''), 5000);
+  };
+
+  // Handler to remove duplicate rows keeping the longest duration
+  const handleRemoveDuplicateParsedRows = () => {
+    const grouped = new Map<string, ParsedParticipantRow>();
+
+    parsedRows.forEach(row => {
+      const key = (row.email && row.email.includes('@'))
+        ? row.email.toLowerCase().trim()
+        : (row.name || '').toLowerCase().trim().replace(/\s+/g, ' ');
+
+      if (grouped.has(key)) {
+        const existing = grouped.get(key)!;
+        if (row.durationMinutes > existing.durationMinutes) {
+          grouped.set(key, row);
+        }
+      } else {
+        grouped.set(key, row);
+      }
+    });
+
+    const uniqueList = Array.from(grouped.values());
+    const countRemoved = parsedRows.length - uniqueList.length;
+    setParsedRows(uniqueList);
+    setSyncSuccessMsg(`Removed ${countRemoved} duplicate attendee row(s), keeping the longest duration records.`);
+    setTimeout(() => setSyncSuccessMsg(''), 5000);
+  };
+
   const totalParsedMinutes = parsedRows.reduce((acc, r) => acc + r.durationMinutes, 0);
   const matchedCount = parsedRows.filter(r => r.status === 'matched').length;
   const guestCount = parsedRows.filter(r => r.status === 'guest').length;
 
-  const filteredParsedRows = parsedRows.filter(r => {
-    if (!searchFilter) return true;
-    const q = searchFilter.toLowerCase();
-    return r.name.toLowerCase().includes(q) || r.email.toLowerCase().includes(q);
-  });
+  // Report match / present first before absent / guest, both alphabetically
+  const filteredParsedRows = useMemo(() => {
+    return parsedRows
+      .filter(r => {
+        if (!searchFilter) return true;
+        const q = searchFilter.toLowerCase();
+        return r.name.toLowerCase().includes(q) || r.email.toLowerCase().includes(q);
+      })
+      .sort((a, b) => {
+        // Matched / Present first, then Guests / Unmatched; both alphabetically A-Z
+        if (a.status !== b.status) {
+          return a.status === 'matched' ? -1 : 1;
+        }
+        return (a.name || '').localeCompare(b.name || '', undefined, { sensitivity: 'base' });
+      });
+  }, [parsedRows, searchFilter]);
 
   return (
     <div className="space-y-8">
@@ -2114,6 +2223,47 @@ export default function ZoomAttendanceSync({ members, onRefreshMembers, onNaviga
                   <p className="text-2xl font-black text-amber-700 mt-1">{totalParsedMinutes} mins</p>
                 </div>
               </div>
+
+              {/* Duplicate Attendees Alert Banner in Parsed Rows */}
+              {duplicateParsedRowsMap.size > 0 && (
+                <div className="bg-amber-50 border-2 border-amber-300 rounded-2xl p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3 animate-in fade-in">
+                  <div className="flex items-center space-x-3">
+                    <div className="w-8 h-8 rounded-xl bg-amber-500 text-white flex items-center justify-center shrink-0">
+                      <CopyX size={16} />
+                    </div>
+                    <div>
+                      <p className="text-xs font-black text-[#1A1F3C]">
+                        Detected {duplicateParsedRowsMap.size} Duplicate Attendee Entries in Uploaded File
+                      </p>
+                      <p className="text-[11px] text-amber-900/80">
+                        Some participants reconnected or appear multiple times with separate durations. You can consolidate them or remove duplicates.
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-2 shrink-0">
+                    <button
+                      type="button"
+                      onClick={handleMergeDuplicateParsedRows}
+                      className="px-3 py-1.5 bg-indigo-700 hover:bg-indigo-800 text-white rounded-xl text-xs font-black uppercase tracking-wider flex items-center space-x-1.5 shadow-sm transition-all cursor-pointer"
+                      title="Sum prayer durations for duplicate attendees and keep 1 consolidated record per person"
+                    >
+                      <GitMerge size={13} />
+                      <span>Merge Reconnects & Durations</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={handleRemoveDuplicateParsedRows}
+                      className="px-3 py-1.5 bg-rose-600 hover:bg-rose-700 text-white rounded-xl text-xs font-black uppercase tracking-wider flex items-center space-x-1.5 shadow-sm transition-all cursor-pointer"
+                      title="Keep single longest duration entry for each person and delete duplicates"
+                    >
+                      <Trash2 size={13} />
+                      <span>Remove Duplicates</span>
+                    </button>
+                  </div>
+                </div>
+              )}
 
               {/* Action bar */}
               <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pt-2">
@@ -2623,6 +2773,15 @@ export default function ZoomAttendanceSync({ members, onRefreshMembers, onNaviga
                         }
                         return true;
                       })
+                      .sort((a, b) => {
+                        // Match / Present members first, then Absent members; both alphabetically A-Z
+                        const aPresent = a.status === 'present';
+                        const bPresent = b.status === 'present';
+                        if (aPresent !== bPresent) {
+                          return aPresent ? -1 : 1;
+                        }
+                        return (a.name || '').localeCompare(b.name || '', undefined, { sensitivity: 'base' });
+                      })
                       .map((row) => {
                         const isPresent = row.status === 'present';
                         const isEditingMins = editingMinutesRowId === row.logId;
@@ -3104,7 +3263,18 @@ export default function ZoomAttendanceSync({ members, onRefreshMembers, onNaviga
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-gray-100">
-                        {sessionLogs.map(log => {
+                        {sessionLogs
+                          .slice()
+                          .sort((a, b) => {
+                            // Present first before reversed/absent, both alphabetically A-Z
+                            const aReversed = a.status === 'reversed_absent';
+                            const bReversed = b.status === 'reversed_absent';
+                            if (aReversed !== bReversed) {
+                              return aReversed ? 1 : -1;
+                            }
+                            return (a.name || '').localeCompare(b.name || '', undefined, { sensitivity: 'base' });
+                          })
+                          .map(log => {
                           const isReversed = log.status === 'reversed_absent';
                           return (
                             <tr key={log.id} className={cn("hover:bg-gray-50", isReversed && "bg-rose-50/30")}>

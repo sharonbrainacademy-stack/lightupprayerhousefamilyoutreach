@@ -20,7 +20,6 @@ const navItems = [
   { name: 'Beliefs', path: '/beliefs' },
   { name: 'Schedule', path: '/schedule' },
   { name: 'Themes', path: '/themes' },
-  { name: '30-Day Scriptures', path: '/reading-plan' },
   { name: 'Outreach', path: '/outreach' },
   { name: 'Media', path: '/media' },
   { name: 'Membership', path: '/join' },
