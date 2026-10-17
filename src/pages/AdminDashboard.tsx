@@ -1839,10 +1839,15 @@ export default function AdminDashboard() {
     .filter(m => isSuperAdmin || !isUserSuperAdmin(m));
   const totalLiveInZoomCount = liveGuestsList.length + liveMembersList.length;
 
-  // Master Protected Account Check
+  // Master Protected Account Check: Protects the primary master super admin account from deletion
   const isAccountProtected = (m: UserProfile) => {
+    if (m.uid === 'admin-master-brainstormacademybsa_gmail_com') return true;
     const email = (m.email || '').toLowerCase().trim();
-    return email === 'brainstormacademybsa@gmail.com';
+    if (email === 'brainstormacademybsa@gmail.com') {
+      // If there are duplicate records, protect the primary master record
+      return m.uid === 'admin-master-brainstormacademybsa_gmail_com';
+    }
+    return false;
   };
 
   // Automatic Duplicate Member Detection Interface & Engine
