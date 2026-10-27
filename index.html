@@ -16,19 +16,20 @@
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
     <script>
+      // Immediately unregister all service workers and clear cache storage in preview/iframe/dev
       if ('serviceWorker' in navigator) {
-        if (window.location.hostname.includes('run.app') || window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') {
-          // Unregister service worker in preview/dev mode to prevent blank screens
-          navigator.serviceWorker.getRegistrations().then(registrations => {
-            for (let registration of registrations) {
-              registration.unregister();
-            }
-          });
-        } else {
-          window.addEventListener('load', () => {
-            navigator.serviceWorker.register('/sw.js');
-          });
-        }
+        navigator.serviceWorker.getRegistrations().then(function(registrations) {
+          for (var i = 0; i < registrations.length; i++) {
+            registrations[i].unregister();
+          }
+        }).catch(function() {});
+      }
+      if ('caches' in window) {
+        caches.keys().then(function(keys) {
+          for (var i = 0; i < keys.length; i++) {
+            caches.delete(keys[i]);
+          }
+        }).catch(function() {});
       }
     </script>
   </body>

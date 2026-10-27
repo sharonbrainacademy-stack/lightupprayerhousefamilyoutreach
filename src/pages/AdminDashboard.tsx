@@ -2455,8 +2455,8 @@ export default function AdminDashboard() {
 
   const menuItems = [
     { id: 'members', name: 'Members & Attendance', icon: Users },
+    { id: 'zoom-sync', name: 'Daily Prayer Attendance (Zoom & WhatsApp)', icon: CheckCircle2 },
     { id: 'attendance-reports', name: 'Attendance Hub & Roster', icon: ClipboardCheck },
-    { id: 'zoom-sync', name: 'Zoom CSV Auto-Sync', icon: FileSpreadsheet },
     { id: 'guests', name: 'Guest / Unregistered Zoom Logs', icon: Video },
     { id: 'whatsapp', name: 'WhatsApp Tracking', icon: MessageCircle },
     { id: 'branding', name: 'Logo & Branding', icon: Palette },
@@ -2902,10 +2902,10 @@ export default function AdminDashboard() {
                   <button
                     onClick={() => setActiveTab('zoom-sync')}
                     className="flex items-center justify-center space-x-2 px-4 py-3 bg-[#1A1F3C] hover:bg-[#282E5C] text-white rounded-xl font-black uppercase tracking-wider text-xs shadow-md shadow-[#1A1F3C]/20 transition-all cursor-pointer border border-gray-700"
-                    title="Import Zoom CSV or PDF to automark attendance"
+                    title="Paste Zoom & WhatsApp attendance records to auto-mark daily prayer attendance"
                   >
-                    <Upload size={16} className="text-[#F26522]" />
-                    <span>Auto-Sync Zoom CSV</span>
+                    <CheckCircle2 size={16} className="text-[#F26522]" />
+                    <span>Daily Attendance (Zoom & WA)</span>
                   </button>
 
                   <button 
