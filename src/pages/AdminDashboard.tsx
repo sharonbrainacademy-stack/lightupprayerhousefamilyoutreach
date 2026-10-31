@@ -42,11 +42,14 @@ import { motion, AnimatePresence } from 'motion/react';
 import ZoomAttendanceSync from '../components/ZoomAttendanceSync';
 import DailyAttendanceReport from '../components/admin/DailyAttendanceReport';
 import ManualAttendanceModal from '../components/admin/ManualAttendanceModal';
+import EditMemberModal from '../components/admin/EditMemberModal';
 import FlyerModal, { FlyerModalData } from '../components/FlyerModal';
 import AdminOutreachTab from '../components/admin/AdminOutreachTab';
 import AdminStaffManagementTab from '../components/admin/AdminStaffManagementTab';
 import AdminBooksTab from '../components/admin/AdminBooksTab';
 import EstherGroupModal from '../components/admin/EstherGroupModal';
+import JoyfulGroupModal from '../components/admin/JoyfulGroupModal';
+import { JOYFUL_GROUP_MEMBERS } from '../data/joyfulGroupMembers';
 import { 
   SermonItem, 
   DEFAULT_SERMONS, 
@@ -171,8 +174,10 @@ export default function AdminDashboard() {
   const [activatingAdmin, setActivatingAdmin] = useState(false);
   const [showLiveRosterModal, setShowLiveRosterModal] = useState(false);
   const [showEstherGroupModal, setShowEstherGroupModal] = useState(false);
+  const [showJoyfulGroupModal, setShowJoyfulGroupModal] = useState(false);
   const [showManualAttendanceModal, setShowManualAttendanceModal] = useState(false);
   const [manualAttendanceSelectedMember, setManualAttendanceSelectedMember] = useState<UserProfile | null>(null);
+  const [editingMember, setEditingMember] = useState<UserProfile | null>(null);
   const [liveTick, setLiveTick] = useState(Date.now());
   const [memberFeedback, setMemberFeedback] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
   const [selectedMemberUids, setSelectedMemberUids] = useState<string[]>([]);
@@ -180,6 +185,70 @@ export default function AdminDashboard() {
   const [deletingMemberUid, setDeletingMemberUid] = useState<string | null>(null);
   const [memberToDelete, setMemberToDelete] = useState<UserProfile | null>(null);
   const [showBulkDeleteModal, setShowBulkDeleteModal] = useState(false);
+  const [copiedPhoneUid, setCopiedPhoneUid] = useState<string | null>(null);
+
+  const handleCopyPhoneNumber = (phone: string, uid: string) => {
+    if (!phone) return;
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(phone);
+      } else {
+        const el = document.createElement('textarea');
+        el.value = phone;
+        document.body.appendChild(el);
+        el.select();
+        document.execCommand('copy');
+        document.body.removeChild(el);
+      }
+      setCopiedPhoneUid(uid);
+      setTimeout(() => {
+        setCopiedPhoneUid(prev => (prev === uid ? null : prev));
+      }, 2000);
+    } catch (err) {
+      console.error('Failed to copy phone number:', err);
+    }
+  };
+
+  const handleCopySelectedPhones = () => {
+    const phones = selectedMemberUids
+      .map(uid => members.find(m => m.uid === uid))
+      .filter((m): m is UserProfile => Boolean(m))
+      .map(m => {
+        const mPhones = extractMemberPhones(m);
+        return m.phone || (mPhones.length > 0 ? mPhones[0].raw : '');
+      })
+      .filter(Boolean);
+
+    if (phones.length === 0) {
+      setMemberFeedback({
+        type: 'error',
+        message: 'None of the selected members have a phone number on record.'
+      });
+      setTimeout(() => setMemberFeedback(null), 4000);
+      return;
+    }
+
+    const text = phones.join(', ');
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text);
+      } else {
+        const el = document.createElement('textarea');
+        el.value = text;
+        document.body.appendChild(el);
+        el.select();
+        document.execCommand('copy');
+        document.body.removeChild(el);
+      }
+      setMemberFeedback({
+        type: 'success',
+        message: `Successfully copied ${phones.length} member phone number${phones.length > 1 ? 's' : ''} to clipboard!`
+      });
+      setTimeout(() => setMemberFeedback(null), 4000);
+    } catch (err) {
+      console.error('Failed to copy phones:', err);
+    }
+  };
 
   // Automatic Duplicate Detection & Resolution States
   const [showDuplicateResolutionModal, setShowDuplicateResolutionModal] = useState(false);
@@ -3088,6 +3157,15 @@ export default function AdminDashboard() {
                   </button>
 
                   <button
+                    onClick={() => setShowJoyfulGroupModal(true)}
+                    className="flex items-center justify-center space-x-2 px-4 py-3 bg-gradient-to-r from-amber-600 to-amber-700 hover:from-amber-700 hover:to-amber-800 text-white rounded-xl font-black uppercase tracking-wider text-xs shadow-md shadow-amber-700/30 transition-all cursor-pointer border border-amber-400/40"
+                    title={`View & manage ${JOYFUL_GROUP_MEMBERS.length} Joyful Group (Abuja) members`}
+                  >
+                    <Users size={16} className="text-amber-200" />
+                    <span>Joyful Group ({JOYFUL_GROUP_MEMBERS.length})</span>
+                  </button>
+
+                  <button
                     onClick={() => setActiveTab('zoom-sync')}
                     className="flex items-center justify-center space-x-2 px-4 py-3 bg-[#1A1F3C] hover:bg-[#282E5C] text-white rounded-xl font-black uppercase tracking-wider text-xs shadow-md shadow-[#1A1F3C]/20 transition-all cursor-pointer border border-gray-700"
                     title="Paste Zoom & WhatsApp attendance records to auto-mark daily prayer attendance"
@@ -3305,7 +3383,16 @@ export default function AdminDashboard() {
                     </div>
                   </div>
 
-                  <div className="flex items-center space-x-3">
+                  <div className="flex flex-wrap items-center gap-2.5">
+                    <button
+                      type="button"
+                      onClick={handleCopySelectedPhones}
+                      className="px-3.5 py-2 bg-emerald-600/90 hover:bg-emerald-600 text-white rounded-xl text-xs font-black uppercase tracking-wider transition-all flex items-center space-x-1.5 shadow-sm cursor-pointer"
+                      title="Copy phone numbers of all selected members to clipboard"
+                    >
+                      <Copy size={13} />
+                      <span>Copy Selected Phones</span>
+                    </button>
                     <button
                       onClick={() => setSelectedMemberUids([])}
                       className="px-3.5 py-2 bg-white/10 hover:bg-white/20 text-white rounded-xl text-xs font-bold transition-all cursor-pointer"
@@ -3451,7 +3538,7 @@ export default function AdminDashboard() {
                           <th className="p-5">Minutes This Year</th>
                           <th className="p-5">Total Prayer Time</th>
                           <th className="p-5">Location</th>
-                          <th className="p-5 text-right min-w-[240px]">Attendance & Actions</th>
+                          <th className="p-5 text-right min-w-[280px]">Attendance & Actions</th>
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-gray-100 text-sm">
@@ -3541,20 +3628,62 @@ export default function AdminDashboard() {
                                       const cleanDigits = rawPhone.replace(/\D/g, '');
                                       const isPhoneDupe = Boolean(duplicateInfo?.hasPhoneDuplicate);
 
-                                      return (
+                                       return (
                                         <div className="flex flex-wrap items-center gap-1.5 mt-1">
-                                          <span className={cn(
-                                            "text-[10px] font-mono flex items-center gap-1 font-bold px-1.5 py-0.5 rounded",
-                                            isPhoneDupe ? "bg-amber-100 text-amber-900 border border-amber-300" : "text-emerald-700"
-                                          )}>
-                                            <Phone size={10} className={isPhoneDupe ? "text-amber-700" : "text-emerald-600"} />
+                                          <button
+                                            type="button"
+                                            onClick={() => handleCopyPhoneNumber(rawPhone, m.uid)}
+                                            className={cn(
+                                              "text-[10px] font-mono flex items-center gap-1 font-bold px-1.5 py-0.5 rounded transition-all cursor-pointer text-left",
+                                              copiedPhoneUid === m.uid
+                                                ? "bg-emerald-100 text-emerald-900 border border-emerald-300 ring-1 ring-emerald-400"
+                                                : isPhoneDupe
+                                                ? "bg-amber-100 text-amber-900 hover:bg-amber-200 border border-amber-300"
+                                                : "bg-emerald-50/70 hover:bg-emerald-100 text-emerald-800 border border-emerald-200"
+                                            )}
+                                            title="Click to copy phone number to clipboard"
+                                          >
+                                            {copiedPhoneUid === m.uid ? (
+                                              <Check size={10} className="text-emerald-700 shrink-0" />
+                                            ) : (
+                                              <Phone size={10} className={isPhoneDupe ? "text-amber-700 shrink-0" : "text-emerald-600 shrink-0"} />
+                                            )}
                                             <span>{rawPhone}</span>
-                                            {isPhoneDupe && (
+                                            {copiedPhoneUid === m.uid ? (
+                                              <span className="ml-1 px-1 bg-emerald-600 text-white text-[8px] font-black uppercase rounded shadow-2xs">
+                                                Copied!
+                                              </span>
+                                            ) : isPhoneDupe ? (
                                               <span className="ml-1 px-1 bg-amber-600 text-white text-[8px] font-black uppercase rounded">
                                                 Duplicate
                                               </span>
+                                            ) : null}
+                                          </button>
+
+                                          <button
+                                            type="button"
+                                            onClick={() => handleCopyPhoneNumber(rawPhone, m.uid)}
+                                            className={cn(
+                                              "inline-flex items-center space-x-1 px-1.5 py-0.5 rounded text-[9px] font-black transition-all cursor-pointer border",
+                                              copiedPhoneUid === m.uid
+                                                ? "bg-emerald-600 text-white border-emerald-600"
+                                                : "bg-gray-100 hover:bg-gray-200 text-gray-700 border-gray-200"
                                             )}
-                                          </span>
+                                            title={`Copy ${rawPhone} to clipboard`}
+                                          >
+                                            {copiedPhoneUid === m.uid ? (
+                                              <>
+                                                <Check size={9} />
+                                                <span>Copied!</span>
+                                              </>
+                                            ) : (
+                                              <>
+                                                <Copy size={9} className="text-gray-500" />
+                                                <span>Copy Phone</span>
+                                              </>
+                                            )}
+                                          </button>
+
                                           {cleanDigits.length >= 7 && (
                                             <a
                                               href={`https://wa.me/${cleanDigits}?text=${encodeURIComponent(`Praise God ${m.displayName || 'beloved'}, welcome to Light Up Prayer House! You are registered in ${memberCommunity}. We are adding you to the official WhatsApp prayer cell.`)}`}
@@ -3700,6 +3829,16 @@ export default function AdminDashboard() {
                                       <span>Delete Duplicate</span>
                                     </button>
                                   )}
+
+                                  {/* Edit Member Record Button */}
+                                  <button
+                                    type="button"
+                                    onClick={() => setEditingMember(m)}
+                                    className="p-2 rounded-xl transition-all inline-flex items-center justify-center text-[#1A1F3C] bg-gray-100 hover:bg-orange-50 hover:text-[#F26522] hover:scale-105 cursor-pointer shadow-xs border border-gray-200"
+                                    title={`Edit ${m.displayName || 'Member'}'s record (name, phone, email, community, role, prayer time)`}
+                                  >
+                                    <Edit3 size={14} />
+                                  </button>
 
                                   <button
                                     onClick={() => setMemberToDelete(m)}
@@ -4044,20 +4183,45 @@ export default function AdminDashboard() {
                                             cluster.matchedPhones.some(mp => normalizePhoneKey(mp) === p.key)
                                           ) || cluster.reason.toLowerCase().includes('phone');
 
-                                          return (
+                                           return (
                                             <div className={cn(
-                                              "p-2 rounded-xl flex items-center justify-between text-xs font-mono font-bold mt-1.5 transition-all",
+                                              "p-2 rounded-xl flex items-center justify-between text-xs font-mono font-bold mt-1.5 transition-all gap-1.5",
                                               isPhoneDupe ? "bg-amber-100 text-amber-900 border border-amber-300" : "bg-gray-50 text-emerald-800 border border-gray-100"
                                             )}>
                                               <div className="flex items-center space-x-1.5 truncate">
                                                 <Phone size={12} className={isPhoneDupe ? "text-amber-700 shrink-0" : "text-emerald-600 shrink-0"} />
-                                                <span className="truncate">{displayPhone}</span>
+                                                <span className="truncate select-all">{displayPhone}</span>
                                               </div>
-                                              {isPhoneDupe && (
-                                                <span className="px-1.5 py-0.5 bg-amber-600 text-white text-[8px] font-black uppercase rounded shrink-0 shadow-2xs">
-                                                  Duplicate
-                                                </span>
-                                              )}
+                                              <div className="flex items-center space-x-1 shrink-0">
+                                                {isPhoneDupe && (
+                                                  <span className="px-1.5 py-0.5 bg-amber-600 text-white text-[8px] font-black uppercase rounded shadow-2xs">
+                                                    Duplicate
+                                                  </span>
+                                                )}
+                                                <button
+                                                  type="button"
+                                                  onClick={() => handleCopyPhoneNumber(displayPhone, mem.uid)}
+                                                  className={cn(
+                                                    "px-2 py-0.5 rounded text-[9px] font-black border flex items-center space-x-1 cursor-pointer transition-all shadow-2xs",
+                                                    copiedPhoneUid === mem.uid
+                                                      ? "bg-emerald-600 text-white border-emerald-600"
+                                                      : "bg-white hover:bg-gray-100 text-gray-700 border-gray-200"
+                                                  )}
+                                                  title={`Copy ${displayPhone}`}
+                                                >
+                                                  {copiedPhoneUid === mem.uid ? (
+                                                    <>
+                                                      <Check size={9} />
+                                                      <span>Copied</span>
+                                                    </>
+                                                  ) : (
+                                                    <>
+                                                      <Copy size={9} className="text-gray-500" />
+                                                      <span>Copy</span>
+                                                    </>
+                                                  )}
+                                                </button>
+                                              </div>
                                             </div>
                                           );
                                         })()}
@@ -4083,6 +4247,17 @@ export default function AdminDashboard() {
                                           <span className="font-black text-xs text-[#F26522]">{formatMinutesToHours(totalMins)}</span>
                                         </div>
                                       </div>
+
+                                      {/* Quick Edit Record Button */}
+                                      <button
+                                        type="button"
+                                        onClick={() => setEditingMember(mem)}
+                                        className="w-full py-1.5 bg-gray-50 hover:bg-orange-50 text-gray-700 hover:text-[#F26522] rounded-xl text-xs font-bold flex items-center justify-center space-x-1.5 transition-all cursor-pointer border border-gray-200"
+                                        title={`Edit ${mem.displayName || 'Member'}'s record`}
+                                      >
+                                        <Edit3 size={12} />
+                                        <span>Edit Record</span>
+                                      </button>
                                     </div>
 
                                     {/* Action buttons for redundant records */}
@@ -6955,6 +7130,16 @@ export default function AdminDashboard() {
             />
           )}
 
+          {showJoyfulGroupModal && (
+            <JoyfulGroupModal
+              isOpen={showJoyfulGroupModal}
+              onClose={() => setShowJoyfulGroupModal(false)}
+              members={members}
+              onFilterByJoyful={() => setCommunityFilter("Joyful Group (Abuja)")}
+              onOpenAttendanceReport={() => setActiveTab('attendance-reports')}
+            />
+          )}
+
           {showManualAttendanceModal && (
             <ManualAttendanceModal
               isOpen={showManualAttendanceModal}
@@ -6968,6 +7153,21 @@ export default function AdminDashboard() {
                 setMemberFeedback({ type: 'success', message: msg });
                 setShowManualAttendanceModal(false);
                 setManualAttendanceSelectedMember(null);
+              }}
+            />
+          )}
+
+          {editingMember && (
+            <EditMemberModal
+              isOpen={Boolean(editingMember)}
+              onClose={() => setEditingMember(null)}
+              member={editingMember}
+              isSuperAdmin={isSuperAdmin}
+              dynamicCommunityOptions={dynamicCommunityOptions}
+              onSuccess={(msg) => {
+                setMemberFeedback({ type: 'success', message: msg });
+                setEditingMember(null);
+                setTimeout(() => setMemberFeedback(null), 5000);
               }}
             />
           )}

@@ -25,10 +25,32 @@ export default function EstherGroupModal({
 }: EstherGroupModalProps) {
   const [search, setSearch] = useState('');
   const [copiedNumbers, setCopiedNumbers] = useState(false);
+  const [copiedPhoneSn, setCopiedPhoneSn] = useState<number | null>(null);
   const [isSyncing, setIsSyncing] = useState(false);
   const [syncStatus, setSyncStatus] = useState<string | null>(null);
 
   const cleanDigits = (val: string) => (val || '').replace(/\D/g, '');
+
+  const handleCopySinglePhone = (sn: number, phone: string) => {
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(phone);
+      } else {
+        const el = document.createElement('textarea');
+        el.value = phone;
+        document.body.appendChild(el);
+        el.select();
+        document.execCommand('copy');
+        document.body.removeChild(el);
+      }
+      setCopiedPhoneSn(sn);
+      setTimeout(() => {
+        setCopiedPhoneSn(prev => (prev === sn ? null : prev));
+      }, 2000);
+    } catch (err) {
+      console.error('Failed to copy single phone:', err);
+    }
+  };
 
   const formatForWhatsApp = (phoneStr: string) => {
     let digits = (phoneStr || '').replace(/\D/g, '');
@@ -298,9 +320,21 @@ export default function EstherGroupModal({
                       </div>
                     </td>
                     <td className="p-3 font-mono font-bold text-gray-700">
-                      <div className="flex items-center space-x-1.5">
-                        <Phone size={12} className="text-emerald-600" />
-                        <span>{m.phone}</span>
+                      <div className="inline-flex items-center space-x-1.5 bg-gray-50 hover:bg-gray-100 px-2.5 py-1 rounded-lg border border-gray-200/80 transition-colors">
+                        <Phone size={12} className="text-emerald-600 shrink-0" />
+                        <span className="text-xs">{m.phone}</span>
+                        <button
+                          type="button"
+                          onClick={() => handleCopySinglePhone(m.sn, m.phone)}
+                          className={`p-1 rounded-md transition-all cursor-pointer ${
+                            copiedPhoneSn === m.sn 
+                              ? 'bg-emerald-500 text-white' 
+                              : 'text-gray-400 hover:text-gray-700 hover:bg-white'
+                          }`}
+                          title="Copy phone number"
+                        >
+                          {copiedPhoneSn === m.sn ? <Check size={11} className="stroke-[3]" /> : <Copy size={11} />}
+                        </button>
                       </div>
                     </td>
                     <td className="p-3">

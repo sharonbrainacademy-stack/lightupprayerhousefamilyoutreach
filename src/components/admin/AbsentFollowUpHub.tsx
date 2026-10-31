@@ -69,8 +69,29 @@ export default function AbsentFollowUpHub({
   const [copiedBroadcastSuccess, setCopiedBroadcastSuccess] = useState(false);
   const [copiedDigestSuccess, setCopiedDigestSuccess] = useState(false);
   const [copiedIndividualUid, setCopiedIndividualUid] = useState<string | null>(null);
+  const [copiedPhoneUid, setCopiedPhoneUid] = useState<string | null>(null);
   const [batchActionRunning, setBatchActionRunning] = useState(false);
   const [bannerNotice, setBannerNotice] = useState<string | null>(null);
+
+  const handleCopyMemberPhone = (phone: string, uid: string) => {
+    if (!phone) return;
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(phone);
+      } else {
+        const el = document.createElement('textarea');
+        el.value = phone;
+        document.body.appendChild(el);
+        el.select();
+        document.execCommand('copy');
+        document.body.removeChild(el);
+      }
+      setCopiedPhoneUid(uid);
+      setTimeout(() => setCopiedPhoneUid(prev => (prev === uid ? null : prev)), 2000);
+    } catch (err) {
+      console.error('Failed to copy phone:', err);
+    }
+  };
 
   // Subscribe to real-time followups for this date
   useEffect(() => {
@@ -851,9 +872,34 @@ export default function AbsentFollowUpHub({
 
                         <div className="flex flex-wrap items-center gap-3 text-xs text-gray-500 font-medium">
                           {hasPhone ? (
-                            <span className="font-mono text-gray-700 font-bold bg-gray-100 px-2 py-0.5 rounded">
-                              📞 {item.phone}
-                            </span>
+                            <div className="inline-flex items-center space-x-1.5">
+                              <span className="font-mono text-gray-700 font-bold bg-gray-100 px-2 py-0.5 rounded">
+                                📞 {item.phone}
+                              </span>
+                              <button
+                                type="button"
+                                onClick={() => handleCopyMemberPhone(item.phone, item.uid)}
+                                className={cn(
+                                  "inline-flex items-center space-x-1 px-1.5 py-0.5 rounded text-[10px] font-bold border transition-all cursor-pointer shadow-2xs",
+                                  copiedPhoneUid === item.uid
+                                    ? "bg-emerald-600 text-white border-emerald-600"
+                                    : "bg-white hover:bg-gray-100 text-gray-600 border-gray-200"
+                                )}
+                                title={`Copy ${item.phone}`}
+                              >
+                                {copiedPhoneUid === item.uid ? (
+                                  <>
+                                    <Check size={10} />
+                                    <span>Copied!</span>
+                                  </>
+                                ) : (
+                                  <>
+                                    <Copy size={10} />
+                                    <span>Copy</span>
+                                  </>
+                                )}
+                              </button>
+                            </div>
                           ) : (
                             <span className="text-rose-500 italic">No phone number on record</span>
                           )}
