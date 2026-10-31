@@ -16,10 +16,11 @@ import {
 } from 'lucide-react';
 import { 
   doc, updateDoc, arrayUnion, arrayRemove, 
-  increment, writeBatch, getDoc 
+  increment, writeBatch, getDoc, collection, 
+  query, where, onSnapshot 
 } from 'firebase/firestore';
 import { db } from '../../lib/firebase';
-import { UserProfile } from '../../types';
+import { UserProfile, ZoomParticipantLog } from '../../types';
 import { getTodayDateString } from '../../lib/attendance';
 import { getMemberWhatsAppCommunity, WHATSAPP_COMMUNITY_OPTIONS } from '../../lib/whatsapp';
 import { cn } from '../../lib/utils';
@@ -67,6 +68,28 @@ export default function DailyAttendanceReport({
       setSelectedDate(initialDate);
     }
   }, [initialDate]);
+  const [sessionLogs, setSessionLogs] = useState<ZoomParticipantLog[]>([]);
+
+  // Synchronize with exact Zoom & WhatsApp attendance logs recorded for selectedDate
+  useEffect(() => {
+    let unsubscribe: () => void = () => {};
+    try {
+      const q = query(collection(db, 'zoom_participant_logs'), where('date', '==', selectedDate));
+      unsubscribe = onSnapshot(q, (snapshot) => {
+        const logs = snapshot.docs.map(docSnap => ({
+          id: docSnap.id,
+          ...docSnap.data()
+        })) as ZoomParticipantLog[];
+        setSessionLogs(logs);
+      }, (err) => {
+        console.warn('Error listening to zoom_participant_logs:', err);
+      });
+    } catch (e) {
+      console.warn('Failed to query zoom_participant_logs:', e);
+    }
+    return () => unsubscribe();
+  }, [selectedDate]);
+
   const [selectedGroup, setSelectedGroup] = useState<string>('all');
   const [statusFilter, setStatusFilter] = useState<'all' | 'present' | 'absent'>('all');
   const [searchQuery, setSearchQuery] = useState('');
@@ -141,17 +164,27 @@ export default function DailyAttendanceReport({
     return Array.from(datesSet).sort().reverse();
   }, [members, todayStr]);
 
-  // Helper to determine if a member was present on a given date
+  // Helper to determine if a member was present on a given date (prioritizes sessionLogs)
   const checkMemberPresentOnDate = (m: UserProfile, dateStr: string): { isPresent: boolean; minutes: number } => {
-    const isToday = dateStr === todayStr;
-    const hasInDaysList = Array.isArray(m.attendanceDaysList) && m.attendanceDaysList.includes(dateStr);
-    const hasLastAttended = m.lastAttendedDate === dateStr;
-    const recordedMins = m.dailyMinutes?.[dateStr] || 0;
-    const hasTodayMinutes = isToday && (m.todayMinutes || 0) > 0;
-    const isZoomLive = isToday && Boolean(m.isZoomActive);
+    // 1. Check if there is an explicit participant log in sessionLogs for this member on this date
+    if (sessionLogs.length > 0) {
+      const memberLog = sessionLogs.find(l => 
+        (l.memberUid && l.memberUid === m.uid) || 
+        (l.email && m.email && l.email.toLowerCase().trim() === m.email.toLowerCase().trim())
+      );
+      if (memberLog) {
+        if (memberLog.status === 'reversed_absent') {
+          return { isPresent: false, minutes: 0 };
+        }
+        return { isPresent: true, minutes: memberLog.durationMinutes || 60 };
+      }
+    }
 
-    const isPresent = Boolean(hasInDaysList || hasLastAttended || recordedMins > 0 || hasTodayMinutes || isZoomLive);
-    const minutes = recordedMins > 0 ? recordedMins : (isToday ? (m.todayMinutes || (isPresent ? 60 : 0)) : (isPresent ? 60 : 0));
+    // 2. Check member profile attendanceDaysList & dailyMinutes
+    const hasInDaysList = Array.isArray(m.attendanceDaysList) && m.attendanceDaysList.includes(dateStr);
+    const recordedMins = m.dailyMinutes?.[dateStr] || 0;
+    const isPresent = Boolean(hasInDaysList || recordedMins > 0);
+    const minutes = recordedMins > 0 ? recordedMins : (isPresent ? 60 : 0);
 
     return { isPresent, minutes };
   };
@@ -181,8 +214,21 @@ export default function DailyAttendanceReport({
       };
     });
 
-    const presentList = rows.filter(r => r.isPresent);
-    const absentList = rows.filter(r => !r.isPresent);
+    // Also include guest visitors who attended on this date
+    const guestLogs = sessionLogs.filter(l => !l.isMember && l.status !== 'reversed_absent');
+    const guestRows: MemberAttendanceRow[] = (groupName === 'all' || groupName === 'Unassigned') ? guestLogs.map(g => ({
+      member: null as any,
+      isPresent: true,
+      minutes: g.durationMinutes || 60,
+      displayName: g.name,
+      phone: '',
+      email: g.email || '',
+      community: g.whatsappCommunity || 'Guest Visitor'
+    })) : [];
+
+    const allRows = [...rows, ...guestRows];
+    const presentList = allRows.filter(r => r.isPresent);
+    const absentList = allRows.filter(r => !r.isPresent);
 
     presentList.sort((a, b) => a.displayName.localeCompare(b.displayName, undefined, { sensitivity: 'base' }));
     absentList.sort((a, b) => a.displayName.localeCompare(b.displayName, undefined, { sensitivity: 'base' }));
@@ -190,10 +236,10 @@ export default function DailyAttendanceReport({
     const sortedUnified = [...presentList, ...absentList];
 
     return {
-      total: rows.length,
+      total: allRows.length,
       presentCount: presentList.length,
       absentCount: absentList.length,
-      attendanceRate: rows.length > 0 ? Math.round((presentList.length / rows.length) * 100) : 0,
+      attendanceRate: allRows.length > 0 ? Math.round((presentList.length / allRows.length) * 100) : 0,
       presentList,
       absentList,
       sortedUnified
@@ -203,7 +249,7 @@ export default function DailyAttendanceReport({
   // Current active report data for the selected group & date
   const activeReport = useMemo(() => {
     return getProcessedRosterForGroup(selectedGroup, selectedDate);
-  }, [members, selectedGroup, selectedDate]);
+  }, [members, selectedGroup, selectedDate, sessionLogs]);
 
   // Filtered displayed rows
   const displayedRows = useMemo(() => {
@@ -414,14 +460,15 @@ export default function DailyAttendanceReport({
   // Export CSV strictly formatted with Present first then Absent (both alphabetical)
   const handleExportCSV = (groupToExport = selectedGroup) => {
     const reportData = getProcessedRosterForGroup(groupToExport, selectedDate);
-    const groupLabel = groupToExport === 'all' ? 'All Groups' : groupToExport;
+    const groupLabel = groupToExport === 'all' ? 'All Prayer Groups' : groupToExport;
 
     const headers = [
       'S/N',
       'Attendance Status',
-      'Member Name',
+      'Member / Attendee Name',
+      'Member Type',
+      'WhatsApp Group / Community',
       'Phone Number',
-      'WhatsApp Group',
       'Email',
       'Prayer Minutes',
       'Report Date'
@@ -432,31 +479,34 @@ export default function DailyAttendanceReport({
       `"${sn++}"`,
       `"${r.isPresent ? 'PRESENT' : 'ABSENT'}"`,
       `"${r.displayName.replace(/"/g, '""')}"`,
-      `"${(r.phone || '').replace(/"/g, '""')}"`,
+      `"${r.member ? 'Registered Member' : 'Guest Visitor'}"`,
       `"${r.community.replace(/"/g, '""')}"`,
+      `"${(r.phone || '').replace(/"/g, '""')}"`,
       `"${(r.email || '').replace(/"/g, '""')}"`,
       `"${r.isPresent ? (r.minutes || 60) : 0}"`,
       `"${selectedDate}"`
     ]);
 
-    const csvContent = 'data:text/csv;charset=utf-8,\uFEFF' + [
-      `"LIGHTUP PRAYER ALTAR - DAILY ATTENDANCE REPORT"`,
+    const csvContent = '\uFEFF' + [
+      `"LIGHT UP PRAYER HOUSE — DAILY ONLINE PRAYER ATTENDANCE REPORT"`,
       `"Date: ${selectedDate} (${formattedDateTitle})"`,
-      `"Group: ${groupLabel}"`,
+      `"Prayer Group: ${groupLabel}"`,
       `"Summary: ${reportData.presentCount} Present, ${reportData.absentCount} Absent (${reportData.attendanceRate}% Attendance Rate)"`,
       '',
       headers.join(','),
       ...rows.map(r => r.join(','))
-    ].join('\n');
+    ].join('\r\n');
 
-    const encodedUri = encodeURI(csvContent);
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
-    link.setAttribute('href', encodedUri);
+    link.setAttribute('href', url);
     const sanitizedGroup = groupLabel.replace(/[^a-zA-Z0-9]/g, '_');
-    link.setAttribute('download', `Attendance_Report_${sanitizedGroup}_${selectedDate}.csv`);
+    link.setAttribute('download', `LightUp_Attendance_Report_${sanitizedGroup}_${selectedDate}.csv`);
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
+    URL.revokeObjectURL(url);
   };
 
   // Generate WhatsApp formatted report

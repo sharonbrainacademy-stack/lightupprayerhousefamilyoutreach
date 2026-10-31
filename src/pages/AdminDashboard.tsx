@@ -1850,13 +1850,77 @@ export default function AdminDashboard() {
     return false;
   };
 
+  // Helper to extract and normalize phone numbers for accurate duplicate detection across international & local formats
+  const normalizePhoneKey = (raw?: string | null): string | null => {
+    if (!raw || typeof raw !== 'string') return null;
+    const digits = raw.replace(/\D/g, '');
+    if (digits.length < 7) return null;
+
+    let cleaned = digits;
+    // Strip international call prefixes: 00...
+    if (cleaned.startsWith('00')) {
+      cleaned = cleaned.slice(2);
+    }
+    // Common Nigerian user typo prefix: 234080... -> 23480...
+    if (cleaned.startsWith('2340') && cleaned.length >= 14) {
+      cleaned = '234' + cleaned.slice(4);
+    }
+    // Country code 234: 2348031234567 -> 8031234567 (10 digits)
+    if (cleaned.startsWith('234') && cleaned.length >= 13) {
+      cleaned = cleaned.slice(3);
+    }
+    // Nigerian / UK national leading 0: 08031234567 -> 8031234567
+    if (cleaned.startsWith('0') && cleaned.length >= 11) {
+      cleaned = cleaned.slice(1);
+    }
+    // US/Canada: 18005550199 -> 8005550199
+    if (cleaned.startsWith('1') && cleaned.length === 11) {
+      cleaned = cleaned.slice(1);
+    }
+    // If still longer than 10 digits, take the trailing 10 digits (the core subscriber number)
+    if (cleaned.length > 10) {
+      cleaned = cleaned.slice(-10);
+    }
+
+    return cleaned.length >= 7 ? cleaned : null;
+  };
+
+  const extractMemberPhones = (m: UserProfile): Array<{ raw: string; key: string }> => {
+    const candidates: string[] = [];
+    if (m.phone && typeof m.phone === 'string') candidates.push(m.phone);
+    if ((m as any).phoneNumber && typeof (m as any).phoneNumber === 'string') candidates.push((m as any).phoneNumber);
+    if ((m as any).whatsappNumber && typeof (m as any).whatsappNumber === 'string') candidates.push((m as any).whatsappNumber);
+    if ((m as any).mobile && typeof (m as any).mobile === 'string') candidates.push((m as any).mobile);
+    if ((m as any).telephone && typeof (m as any).telephone === 'string') candidates.push((m as any).telephone);
+    if (m.whatsappGroup && typeof m.whatsappGroup === 'string') {
+      const rawG = m.whatsappGroup.trim();
+      const digitsOnly = rawG.replace(/\D/g, '');
+      if (digitsOnly.length >= 7 && /^\+?[0-9\s\-()]{7,}$/.test(rawG)) {
+        candidates.push(rawG);
+      }
+    }
+
+    const result: Array<{ raw: string; key: string }> = [];
+    const seenKeys = new Set<string>();
+
+    for (const raw of candidates) {
+      const key = normalizePhoneKey(raw);
+      if (key && !seenKeys.has(key)) {
+        seenKeys.add(key);
+        result.push({ raw: raw.trim(), key });
+      }
+    }
+
+    return result;
+  };
+
   // Automatic Duplicate Member Detection Interface & Engine
   const duplicateMemberClusters = useMemo(() => {
     // Only evaluate visible candidates (hide super admins if viewer isn't super admin)
     const candidateMembers = members.filter(m => isSuperAdmin || !isUserSuperAdmin(m));
 
     const emailMap = new Map<string, UserProfile[]>();
-    const phoneMap = new Map<string, UserProfile[]>();
+    const phoneMap = new Map<string, { members: UserProfile[]; rawNumbers: string[] }>();
     const nameMap = new Map<string, UserProfile[]>();
 
     candidateMembers.forEach(m => {
@@ -1867,16 +1931,20 @@ export default function AdminDashboard() {
         emailMap.set(email, list);
       }
 
-      const digits = (m.phone || m.whatsappGroup || '').replace(/\D/g, '');
-      if (digits.length >= 7) {
-        const key = digits.length > 10 ? digits.slice(-10) : digits;
-        const list = phoneMap.get(key) || [];
-        list.push(m);
-        phoneMap.set(key, list);
-      }
+      const phones = extractMemberPhones(m);
+      phones.forEach(p => {
+        const entry = phoneMap.get(p.key) || { members: [], rawNumbers: [] };
+        if (!entry.members.some(existing => existing.uid === m.uid)) {
+          entry.members.push(m);
+        }
+        if (!entry.rawNumbers.includes(p.raw)) {
+          entry.rawNumbers.push(p.raw);
+        }
+        phoneMap.set(p.key, entry);
+      });
 
       const name = (m.displayName || '').toLowerCase().trim().replace(/\s+/g, ' ');
-      if (name.length >= 3 && name !== 'unnamed member') {
+      if (name.length >= 3 && name !== 'unnamed member' && name !== 'member') {
         const list = nameMap.get(name) || [];
         list.push(m);
         nameMap.set(name, list);
@@ -1905,9 +1973,9 @@ export default function AdminDashboard() {
         for (let i = 1; i < list.length; i++) union(list[0].uid, list[i].uid);
       }
     });
-    phoneMap.forEach(list => {
-      if (list.length > 1) {
-        for (let i = 1; i < list.length; i++) union(list[0].uid, list[i].uid);
+    phoneMap.forEach(entry => {
+      if (entry.members.length > 1) {
+        for (let i = 1; i < entry.members.length; i++) union(entry.members[0].uid, entry.members[i].uid);
       }
     });
     nameMap.forEach(list => {
@@ -1928,6 +1996,7 @@ export default function AdminDashboard() {
       id: string;
       matchType: 'email' | 'phone' | 'name';
       matchValue: string;
+      matchedPhones: string[];
       reason: string;
       members: UserProfile[];
       primaryUid: string;
@@ -1940,29 +2009,66 @@ export default function AdminDashboard() {
       const reasons: string[] = [];
       let matchType: 'email' | 'phone' | 'name' = 'name';
       let matchVal = '';
+      const matchedPhones: string[] = [];
 
-      const emails = new Set(clusterMembers.map(m => (m.email || '').toLowerCase().trim()).filter(Boolean));
-      if (emails.size < clusterMembers.length && emails.size > 0) {
+      // 1. Exact Email Match
+      const emailCounts = new Map<string, number>();
+      clusterMembers.forEach(m => {
+        const em = (m.email || '').toLowerCase().trim();
+        if (em && em.includes('@')) {
+          emailCounts.set(em, (emailCounts.get(em) || 0) + 1);
+        }
+      });
+      const dupEmails = Array.from(emailCounts.entries()).filter(([_, c]) => c > 1).map(([em]) => em);
+      if (dupEmails.length > 0) {
         reasons.push('Exact Email Match');
         matchType = 'email';
-        matchVal = Array.from(emails)[0];
+        matchVal = dupEmails[0];
       }
 
-      const phones = new Set(clusterMembers.map(m => (m.phone || m.whatsappGroup || '').replace(/\D/g, '')).filter(d => d.length >= 7));
-      if (phones.size < clusterMembers.length && phones.size > 0) {
-        reasons.push('Phone Number Match');
-        if (!matchVal) {
+      // 2. Phone Number Match
+      const phoneKeyMap = new Map<string, { count: number; rawSamples: string[] }>();
+      clusterMembers.forEach(m => {
+        const mPhones = extractMemberPhones(m);
+        mPhones.forEach(p => {
+          const entry = phoneKeyMap.get(p.key) || { count: 0, rawSamples: [] };
+          entry.count += 1;
+          if (!entry.rawSamples.includes(p.raw)) entry.rawSamples.push(p.raw);
+          phoneKeyMap.set(p.key, entry);
+        });
+      });
+
+      const dupPhones: Array<{ key: string; count: number; raw: string }> = [];
+      phoneKeyMap.forEach((data, key) => {
+        if (data.count > 1) {
+          dupPhones.push({ key, count: data.count, raw: data.rawSamples[0] });
+          matchedPhones.push(data.rawSamples[0]);
+        }
+      });
+
+      if (dupPhones.length > 0) {
+        const phoneListStr = dupPhones.map(dp => dp.raw).join(', ');
+        reasons.push(`Duplicate Phone (${phoneListStr})`);
+        if (!matchVal || matchType !== 'email') {
           matchType = 'phone';
-          matchVal = clusterMembers.find(m => m.phone)?.phone || '';
+          matchVal = phoneListStr;
         }
       }
 
-      const names = new Set(clusterMembers.map(m => (m.displayName || '').toLowerCase().trim()).filter(Boolean));
-      if (names.size < clusterMembers.length && names.size > 0) {
+      // 3. Identical Full Name
+      const nameCounts = new Map<string, number>();
+      clusterMembers.forEach(m => {
+        const nm = (m.displayName || '').toLowerCase().trim().replace(/\s+/g, ' ');
+        if (nm.length >= 3 && nm !== 'unnamed member' && nm !== 'member') {
+          nameCounts.set(nm, (nameCounts.get(nm) || 0) + 1);
+        }
+      });
+      const dupNames = Array.from(nameCounts.entries()).filter(([_, c]) => c > 1).map(([nm]) => nm);
+      if (dupNames.length > 0) {
         reasons.push('Identical Full Name');
         if (!matchVal) {
           matchType = 'name';
-          matchVal = clusterMembers[0].displayName || '';
+          matchVal = clusterMembers[0].displayName || dupNames[0];
         }
       }
 
@@ -2007,6 +2113,7 @@ export default function AdminDashboard() {
         id: rootId,
         matchType,
         matchValue: matchVal,
+        matchedPhones,
         reason: reasons.join(' & '),
         members: sortedByBest,
         primaryUid: chosenPrimary.uid,
@@ -2026,13 +2133,42 @@ export default function AdminDashboard() {
     return duplicateMemberClusters.flatMap(c => c.members.map(m => m.uid));
   }, [duplicateMemberClusters]);
 
+  const allDuplicatePhoneMemberUids = useMemo(() => {
+    return duplicateMemberClusters
+      .filter(c => c.matchedPhones.length > 0 || c.matchType === 'phone' || c.reason.toLowerCase().includes('phone'))
+      .flatMap(c => c.members.map(m => m.uid));
+  }, [duplicateMemberClusters]);
+
+  const phoneDuplicateClustersCount = useMemo(() => {
+    return duplicateMemberClusters.filter(c => c.matchedPhones.length > 0 || c.matchType === 'phone' || c.reason.toLowerCase().includes('phone')).length;
+  }, [duplicateMemberClusters]);
+
+  const emailDuplicateClustersCount = useMemo(() => {
+    return duplicateMemberClusters.filter(c => c.matchType === 'email' || c.reason.toLowerCase().includes('email')).length;
+  }, [duplicateMemberClusters]);
+
+  const nameDuplicateClustersCount = useMemo(() => {
+    return duplicateMemberClusters.filter(c => c.matchType === 'name' || c.reason.toLowerCase().includes('name')).length;
+  }, [duplicateMemberClusters]);
+
   const duplicateMemberClusterMap = useMemo(() => {
-    const map = new Map<string, { cluster: typeof duplicateMemberClusters[0]; isPrimary: boolean }>();
+    const map = new Map<string, { 
+      cluster: typeof duplicateMemberClusters[0]; 
+      isPrimary: boolean;
+      hasPhoneDuplicate: boolean;
+      matchedPhone?: string;
+    }>();
     duplicateMemberClusters.forEach(cluster => {
       cluster.members.forEach(m => {
+        const mPhones = extractMemberPhones(m);
+        const matchingPhone = mPhones.find(p => 
+          cluster.matchedPhones.some(mp => normalizePhoneKey(mp) === p.key)
+        );
         map.set(m.uid, {
           cluster,
-          isPrimary: m.uid === cluster.primaryUid
+          isPrimary: m.uid === cluster.primaryUid,
+          hasPhoneDuplicate: Boolean(matchingPhone || cluster.matchedPhones.length > 0),
+          matchedPhone: matchingPhone ? matchingPhone.raw : (cluster.matchedPhones[0] || undefined)
         });
       });
     });
@@ -2060,6 +2196,8 @@ export default function AdminDashboard() {
       matchesRole = isMemberInZoomNow(m);
     } else if (roleFilter === 'duplicates') {
       matchesRole = allDuplicateMemberUids.includes(m.uid);
+    } else if (roleFilter === 'duplicate_phones') {
+      matchesRole = allDuplicatePhoneMemberUids.includes(m.uid);
     } else if (roleFilter !== 'all') {
       matchesRole = m.role === roleFilter;
     }
@@ -2096,37 +2234,87 @@ export default function AdminDashboard() {
     return Array.from(set);
   }, [members]);
 
-  // Export CSV function
+  // Export CSV function: Exact report of member attendance (Present first A-Z, Absent next A-Z)
   const handleExportCSV = () => {
     if (filteredMembers.length === 0) return;
+    const todayStr = getTodayDateString();
+
+    // Check attendance status for each member
+    const mapped = filteredMembers.map(m => {
+      const isPres = Boolean(
+        (Array.isArray(m.attendanceDaysList) && m.attendanceDaysList.includes(todayStr)) ||
+        (m.dailyMinutes?.[todayStr] || 0) > 0 ||
+        (m.todayMinutes || 0) > 0 ||
+        m.lastAttendedDate === todayStr
+      );
+      return {
+        member: m,
+        isPresent: isPres,
+        displayName: (m.displayName || '').trim() || m.email || 'Member',
+        community: getMemberWhatsAppCommunity(m),
+        phone: m.phone || m.whatsappGroup || '',
+        email: m.email || '',
+        todayMinutes: isPres ? (m.dailyMinutes?.[todayStr] || m.todayMinutes || 60) : 0,
+        daysAttended: m.attendanceCount || m.attendanceDaysList?.length || 0,
+        totalMinutes: m.totalMinutes || 0
+      };
+    });
+
+    const presentMembers = mapped.filter(r => r.isPresent);
+    const absentMembers = mapped.filter(r => !r.isPresent);
+
+    presentMembers.sort((a, b) => a.displayName.localeCompare(b.displayName, undefined, { sensitivity: 'base' }));
+    absentMembers.sort((a, b) => a.displayName.localeCompare(b.displayName, undefined, { sensitivity: 'base' }));
+
+    const sortedUnified = [...presentMembers, ...absentMembers];
+    const totalCount = sortedUnified.length;
+    const rate = totalCount > 0 ? Math.round((presentMembers.length / totalCount) * 100) : 0;
+
     const headers = [
-      'UID', 'Name', 'Email', 'Role', 'WhatsApp Community', 'Phone Number', 
-      'Country', 'Timezone', 'Days Attended', 'Today Minutes', 'This Year Minutes', 'Total Minutes', 'Joined Date'
+      'S/N',
+      'Today Attendance Status',
+      'Member Name',
+      'WhatsApp Community',
+      'Phone Number',
+      'Email',
+      'Today Prayer Minutes',
+      'Total Days Attended',
+      'Total Lifetime Minutes',
+      'Report Date'
     ];
-    const rows = filteredMembers.map(m => [
-      `"${m.uid}"`,
-      `"${m.displayName || ''}"`,
-      `"${m.email || ''}"`,
-      `"${m.role}"`,
-      `"${getMemberWhatsAppCommunity(m)}"`,
-      `"${m.phone || m.whatsappGroup || ''}"`,
-      `"${m.country || ''}"`,
-      `"${m.timezone || ''}"`,
-      `"${m.attendanceCount || m.attendanceDaysList?.length || 0}"`,
-      `"${m.todayMinutes || 0}"`,
-      `"${m.thisYearMinutes || m.thisWeekMinutes || 0}"`,
-      `"${m.totalMinutes || 0}"`,
-      `"${m.joinedAt ? new Date(m.joinedAt).toLocaleDateString() : ''}"`
+
+    let sn = 1;
+    const rows = sortedUnified.map(r => [
+      `"${sn++}"`,
+      `"${r.isPresent ? 'PRESENT' : 'ABSENT'}"`,
+      `"${r.displayName.replace(/"/g, '""')}"`,
+      `"${r.community.replace(/"/g, '""')}"`,
+      `"${r.phone.replace(/"/g, '""')}"`,
+      `"${r.email.replace(/"/g, '""')}"`,
+      `"${r.todayMinutes}"`,
+      `"${r.daysAttended}"`,
+      `"${r.totalMinutes}"`,
+      `"${todayStr}"`
     ]);
 
-    const csvContent = 'data:text/csv;charset=utf-8,' + [headers.join(','), ...rows.map(r => r.join(','))].join('\n');
-    const encodedUri = encodeURI(csvContent);
+    const csvContent = '\uFEFF' + [
+      `"LIGHT UP PRAYER HOUSE — MEMBERS DAILY ATTENDANCE REPORT"`,
+      `"Report Date: ${todayStr}"`,
+      `"Summary: ${presentMembers.length} Present, ${absentMembers.length} Absent (${rate}% Attendance Rate)"`,
+      '',
+      headers.join(','),
+      ...rows.map(r => r.join(','))
+    ].join('\r\n');
+
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
-    link.setAttribute('href', encodedUri);
-    link.setAttribute('download', `LightUp_Members_Attendance_${new Date().toISOString().split('T')[0]}.csv`);
+    link.setAttribute('href', url);
+    link.setAttribute('download', `LightUp_Daily_Attendance_Report_${todayStr}.csv`);
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
+    URL.revokeObjectURL(url);
   };
 
   // Member Selection Helpers
@@ -3036,18 +3224,57 @@ export default function AdminDashboard() {
                         </span>
                       </div>
                       <p className="text-xs text-amber-900/80 mt-1 font-medium leading-relaxed">
-                        We detected duplicate registered members sharing exact emails, phone numbers, or full names. You can inspect side-by-side comparisons, merge prayer records, or delete redundant duplicates in one click.
+                        We detected duplicate registered members sharing identical phone numbers, exact emails, or full names. You can inspect side-by-side comparisons, merge prayer records, or delete redundant duplicates in one click.
                       </p>
+
+                      {/* Breakdown badges */}
+                      <div className="flex flex-wrap items-center gap-2 mt-2.5">
+                        {phoneDuplicateClustersCount > 0 && (
+                          <span className="inline-flex items-center space-x-1.5 px-2.5 py-1 bg-amber-200/80 text-amber-900 border border-amber-400/60 rounded-lg text-[11px] font-bold shadow-2xs">
+                            <Phone size={12} className="text-amber-700" />
+                            <span>{phoneDuplicateClustersCount} Phone Number Match{phoneDuplicateClustersCount > 1 ? 'es' : ''}</span>
+                          </span>
+                        )}
+                        {emailDuplicateClustersCount > 0 && (
+                          <span className="inline-flex items-center space-x-1.5 px-2.5 py-1 bg-blue-100 text-blue-900 border border-blue-300 rounded-lg text-[11px] font-bold">
+                            <Mail size={12} className="text-blue-700" />
+                            <span>{emailDuplicateClustersCount} Email Match{emailDuplicateClustersCount > 1 ? 'es' : ''}</span>
+                          </span>
+                        )}
+                        {nameDuplicateClustersCount > 0 && (
+                          <span className="inline-flex items-center space-x-1.5 px-2.5 py-1 bg-purple-100 text-purple-900 border border-purple-300 rounded-lg text-[11px] font-bold">
+                            <Users size={12} className="text-purple-700" />
+                            <span>{nameDuplicateClustersCount} Name Match{nameDuplicateClustersCount > 1 ? 'es' : ''}</span>
+                          </span>
+                        )}
+                      </div>
                     </div>
                   </div>
 
                   <div className="flex flex-wrap items-center gap-2.5 shrink-0 w-full md:w-auto">
+                    {phoneDuplicateClustersCount > 0 && (
+                      <button
+                        onClick={() => {
+                          setDuplicateClusterFilter('phone');
+                          setShowDuplicateResolutionModal(true);
+                        }}
+                        className="flex-1 md:flex-initial px-3.5 py-2.5 bg-amber-600 hover:bg-amber-700 text-white rounded-xl text-xs font-black uppercase tracking-wider flex items-center justify-center space-x-1.5 shadow-sm transition-all cursor-pointer"
+                        title="Review and resolve phone number duplicates"
+                      >
+                        <Phone size={14} />
+                        <span>Phone Duplicates ({phoneDuplicateClustersCount})</span>
+                      </button>
+                    )}
+
                     <button
-                      onClick={() => setShowDuplicateResolutionModal(true)}
+                      onClick={() => {
+                        setDuplicateClusterFilter('all');
+                        setShowDuplicateResolutionModal(true);
+                      }}
                       className="flex-1 md:flex-initial px-4 py-2.5 bg-[#1A1F3C] hover:bg-[#282E5C] text-white rounded-xl text-xs font-black uppercase tracking-wider flex items-center justify-center space-x-2 shadow-sm transition-all cursor-pointer"
                     >
                       <Layers size={15} className="text-amber-400" />
-                      <span>Review & Resolve</span>
+                      <span>Review & Resolve All</span>
                     </button>
 
                     <button
@@ -3056,18 +3283,6 @@ export default function AdminDashboard() {
                     >
                       <Trash2 size={15} />
                       <span>Delete All Duplicates ({allRedundantDuplicateUids.length})</span>
-                    </button>
-
-                    <button
-                      onClick={() => setRoleFilter(roleFilter === 'duplicates' ? 'all' : 'duplicates')}
-                      className={cn(
-                        "px-3 py-2.5 rounded-xl text-xs font-black uppercase tracking-wider flex items-center justify-center space-x-1.5 transition-all cursor-pointer border",
-                        roleFilter === 'duplicates'
-                          ? "bg-amber-600 text-white border-amber-600 shadow-sm"
-                          : "bg-white text-amber-800 border-amber-300 hover:bg-amber-100"
-                      )}
-                    >
-                      <span>{roleFilter === 'duplicates' ? 'Show All Members' : 'Filter Duplicates in Table'}</span>
                     </button>
                   </div>
                 </div>
@@ -3142,18 +3357,37 @@ export default function AdminDashboard() {
                     <span>Live in Zoom ({liveMembersList.length})</span>
                   </button>
                   {duplicateMemberClusters.length > 0 && (
-                    <button
-                      onClick={() => setRoleFilter(roleFilter === 'duplicates' ? 'all' : 'duplicates')}
-                      className={cn(
-                        "px-4 py-2 rounded-xl text-xs font-bold transition-all cursor-pointer flex items-center space-x-1.5 border",
-                        roleFilter === 'duplicates' 
-                          ? "bg-amber-600 text-white border-amber-600 shadow-sm" 
-                          : "bg-amber-50 text-amber-800 hover:bg-amber-100 border-amber-300"
+                    <div className="flex items-center gap-1.5">
+                      <button
+                        onClick={() => setRoleFilter(roleFilter === 'duplicates' ? 'all' : 'duplicates')}
+                        className={cn(
+                          "px-3 py-2 rounded-xl text-xs font-bold transition-all cursor-pointer flex items-center space-x-1.5 border",
+                          roleFilter === 'duplicates' 
+                            ? "bg-amber-600 text-white border-amber-600 shadow-sm" 
+                            : "bg-amber-50 text-amber-800 hover:bg-amber-100 border-amber-300"
+                        )}
+                        title="Filter all duplicate accounts"
+                      >
+                        <CopyX size={13} className={roleFilter === 'duplicates' ? 'text-white' : 'text-amber-600'} />
+                        <span>All Duplicates ({allRedundantDuplicateUids.length})</span>
+                      </button>
+
+                      {phoneDuplicateClustersCount > 0 && (
+                        <button
+                          onClick={() => setRoleFilter(roleFilter === 'duplicate_phones' ? 'all' : 'duplicate_phones')}
+                          className={cn(
+                            "px-3 py-2 rounded-xl text-xs font-bold transition-all cursor-pointer flex items-center space-x-1.5 border",
+                            roleFilter === 'duplicate_phones' 
+                              ? "bg-amber-600 text-white border-amber-600 shadow-sm" 
+                              : "bg-white text-amber-800 hover:bg-amber-50 border-amber-300"
+                          )}
+                          title="Filter members sharing duplicate phone numbers"
+                        >
+                          <Phone size={12} className={roleFilter === 'duplicate_phones' ? 'text-white' : 'text-amber-700'} />
+                          <span>Phone Duplicates ({allDuplicatePhoneMemberUids.length})</span>
+                        </button>
                       )}
-                    >
-                      <CopyX size={13} className={roleFilter === 'duplicates' ? 'text-white' : 'text-amber-600'} />
-                      <span>Duplicates ({allRedundantDuplicateUids.length})</span>
-                    </button>
+                    </div>
                   )}
                   <select 
                     value={communityFilter}
@@ -3280,7 +3514,7 @@ export default function AdminDashboard() {
                                     </div>
                                     <p className="text-[10px] font-mono text-gray-400">{m.email}</p>
                                     {duplicateInfo && (
-                                      <div className="mt-1">
+                                      <div className="mt-1 flex flex-wrap items-center gap-1.5">
                                         {duplicateInfo.isPrimary ? (
                                           <span className="inline-flex items-center space-x-1 px-2 py-0.5 bg-emerald-100 text-emerald-800 text-[9px] font-black rounded-md border border-emerald-200">
                                             <CheckCheck size={11} className="text-emerald-700" />
@@ -3292,16 +3526,34 @@ export default function AdminDashboard() {
                                             <span>Duplicate ({duplicateInfo.cluster.reason})</span>
                                           </span>
                                         )}
+                                        {duplicateInfo.hasPhoneDuplicate && duplicateInfo.matchedPhone && (
+                                          <span className="inline-flex items-center space-x-1 px-1.5 py-0.5 bg-amber-100 text-amber-900 text-[9px] font-black rounded border border-amber-300">
+                                            <Phone size={10} className="text-amber-700" />
+                                            <span>Duplicate Phone: {duplicateInfo.matchedPhone}</span>
+                                          </span>
+                                        )}
                                       </div>
                                     )}
-                                    {(m.phone || (m.whatsappGroup && m.whatsappGroup.replace(/\D/g, '').length >= 7)) && (() => {
-                                      const rawPhone = m.phone || m.whatsappGroup || '';
+                                    {(() => {
+                                      const mPhones = extractMemberPhones(m);
+                                      const rawPhone = m.phone || (mPhones.length > 0 ? mPhones[0].raw : (m.whatsappGroup && m.whatsappGroup.replace(/\D/g, '').length >= 7 ? m.whatsappGroup : ''));
+                                      if (!rawPhone) return null;
                                       const cleanDigits = rawPhone.replace(/\D/g, '');
+                                      const isPhoneDupe = Boolean(duplicateInfo?.hasPhoneDuplicate);
+
                                       return (
-                                        <div className="flex items-center space-x-2 mt-1">
-                                          <span className="text-[10px] font-mono text-emerald-700 flex items-center gap-1 font-bold">
-                                            <Phone size={10} />
+                                        <div className="flex flex-wrap items-center gap-1.5 mt-1">
+                                          <span className={cn(
+                                            "text-[10px] font-mono flex items-center gap-1 font-bold px-1.5 py-0.5 rounded",
+                                            isPhoneDupe ? "bg-amber-100 text-amber-900 border border-amber-300" : "text-emerald-700"
+                                          )}>
+                                            <Phone size={10} className={isPhoneDupe ? "text-amber-700" : "text-emerald-600"} />
                                             <span>{rawPhone}</span>
+                                            {isPhoneDupe && (
+                                              <span className="ml-1 px-1 bg-amber-600 text-white text-[8px] font-black uppercase rounded">
+                                                Duplicate
+                                              </span>
+                                            )}
                                           </span>
                                           {cleanDigits.length >= 7 && (
                                             <a
@@ -3657,29 +3909,32 @@ export default function AdminDashboard() {
                       <button
                         onClick={() => setDuplicateClusterFilter('exact_email')}
                         className={cn(
-                          "px-3 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer",
-                          duplicateClusterFilter === 'exact_email' ? "bg-amber-600 text-white shadow-xs" : "bg-gray-100 text-gray-600 hover:bg-gray-200"
+                          "px-3 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer flex items-center space-x-1.5",
+                          duplicateClusterFilter === 'exact_email' ? "bg-blue-600 text-white shadow-xs" : "bg-gray-100 text-gray-600 hover:bg-gray-200"
                         )}
                       >
-                        Email Matches ({duplicateMemberClusters.filter(c => c.reason.includes('Email')).length})
+                        <Mail size={12} />
+                        <span>Email Matches ({duplicateMemberClusters.filter(c => c.reason.toLowerCase().includes('email') || c.matchType === 'email').length})</span>
                       </button>
                       <button
                         onClick={() => setDuplicateClusterFilter('phone')}
                         className={cn(
-                          "px-3 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer",
+                          "px-3 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer flex items-center space-x-1.5",
                           duplicateClusterFilter === 'phone' ? "bg-amber-600 text-white shadow-xs" : "bg-gray-100 text-gray-600 hover:bg-gray-200"
                         )}
                       >
-                        Phone Matches ({duplicateMemberClusters.filter(c => c.reason.includes('Phone')).length})
+                        <Phone size={12} />
+                        <span>Phone Matches ({duplicateMemberClusters.filter(c => c.matchedPhones.length > 0 || c.reason.toLowerCase().includes('phone') || c.matchType === 'phone').length})</span>
                       </button>
                       <button
                         onClick={() => setDuplicateClusterFilter('name')}
                         className={cn(
-                          "px-3 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer",
-                          duplicateClusterFilter === 'name' ? "bg-amber-600 text-white shadow-xs" : "bg-gray-100 text-gray-600 hover:bg-gray-200"
+                          "px-3 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer flex items-center space-x-1.5",
+                          duplicateClusterFilter === 'name' ? "bg-purple-600 text-white shadow-xs" : "bg-gray-100 text-gray-600 hover:bg-gray-200"
                         )}
                       >
-                        Name Matches ({duplicateMemberClusters.filter(c => c.reason.includes('Name')).length})
+                        <Users size={12} />
+                        <span>Name Matches ({duplicateMemberClusters.filter(c => c.reason.toLowerCase().includes('name') || c.matchType === 'name').length})</span>
                       </button>
                     </div>
 
@@ -3687,9 +3942,9 @@ export default function AdminDashboard() {
                     <div className="space-y-6 overflow-y-auto pr-1 flex-1">
                       {duplicateMemberClusters
                         .filter(c => {
-                          if (duplicateClusterFilter === 'exact_email') return c.reason.includes('Email');
-                          if (duplicateClusterFilter === 'phone') return c.reason.includes('Phone');
-                          if (duplicateClusterFilter === 'name') return c.reason.includes('Name');
+                          if (duplicateClusterFilter === 'exact_email') return c.reason.toLowerCase().includes('email') || c.matchType === 'email';
+                          if (duplicateClusterFilter === 'phone') return c.matchedPhones.length > 0 || c.reason.toLowerCase().includes('phone') || c.matchType === 'phone';
+                          if (duplicateClusterFilter === 'name') return c.reason.toLowerCase().includes('name') || c.matchType === 'name';
                           return true;
                         })
                         .map((cluster, cIdx) => (
@@ -3701,7 +3956,11 @@ export default function AdminDashboard() {
                                   Cluster #{cIdx + 1}
                                 </span>
                                 <span className="px-2.5 py-1 bg-amber-100 text-amber-900 border border-amber-300 text-[11px] font-bold rounded-lg flex items-center space-x-1">
-                                  <AlertCircle size={12} className="text-amber-700" />
+                                  {(cluster.matchedPhones.length > 0 || cluster.matchType === 'phone' || cluster.reason.toLowerCase().includes('phone')) ? (
+                                    <Phone size={12} className="text-amber-700" />
+                                  ) : (
+                                    <AlertCircle size={12} className="text-amber-700" />
+                                  )}
                                   <span>{cluster.reason}</span>
                                 </span>
                                 {cluster.matchValue && (
@@ -3774,12 +4033,35 @@ export default function AdminDashboard() {
                                       <div className="space-y-1">
                                         <p className="font-black text-sm text-[#1A1F3C] leading-snug">{mem.displayName || 'Unnamed Member'}</p>
                                         <p className="text-xs font-mono text-gray-500 truncate" title={mem.email}>{mem.email || 'No email'}</p>
-                                        {mem.phone && (
-                                          <p className="text-xs font-mono text-emerald-700 font-bold flex items-center space-x-1">
-                                            <Phone size={11} />
-                                            <span>{mem.phone}</span>
-                                          </p>
-                                        )}
+                                        
+                                        {/* Phone details with duplicate highlight */}
+                                        {(() => {
+                                          const memPhones = extractMemberPhones(mem);
+                                          const displayPhone = mem.phone || (memPhones.length > 0 ? memPhones[0].raw : null);
+                                          if (!displayPhone) return null;
+
+                                          const isPhoneDupe = memPhones.some(p => 
+                                            cluster.matchedPhones.some(mp => normalizePhoneKey(mp) === p.key)
+                                          ) || cluster.reason.toLowerCase().includes('phone');
+
+                                          return (
+                                            <div className={cn(
+                                              "p-2 rounded-xl flex items-center justify-between text-xs font-mono font-bold mt-1.5 transition-all",
+                                              isPhoneDupe ? "bg-amber-100 text-amber-900 border border-amber-300" : "bg-gray-50 text-emerald-800 border border-gray-100"
+                                            )}>
+                                              <div className="flex items-center space-x-1.5 truncate">
+                                                <Phone size={12} className={isPhoneDupe ? "text-amber-700 shrink-0" : "text-emerald-600 shrink-0"} />
+                                                <span className="truncate">{displayPhone}</span>
+                                              </div>
+                                              {isPhoneDupe && (
+                                                <span className="px-1.5 py-0.5 bg-amber-600 text-white text-[8px] font-black uppercase rounded shrink-0 shadow-2xs">
+                                                  Duplicate
+                                                </span>
+                                              )}
+                                            </div>
+                                          );
+                                        })()}
+
                                         <div className="pt-1 flex flex-wrap gap-1">
                                           <span className="px-2 py-0.5 bg-gray-100 text-gray-700 text-[10px] font-bold rounded">
                                             Role: {mem.role || 'member'}

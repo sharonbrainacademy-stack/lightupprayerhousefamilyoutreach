@@ -7,7 +7,7 @@ import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { 
   CheckCircle2, AlertTriangle, Users, Clock, RefreshCw, Trash2, 
   Search, Plus, Check, X, Filter, Calendar, ExternalLink, ArrowRight, 
-  Video, Sparkles, Eye, MessageCircle, ClipboardPaste, 
+  Video, Sparkles, Eye, MessageCircle, ClipboardPaste, Download,
   ChevronLeft, ChevronRight, UserCheck, RotateCcw, Edit3, UserX, 
   XCircle, HeartHandshake, Copy, Share2
 } from 'lucide-react';
@@ -822,7 +822,197 @@ export default function ZoomAttendanceSync({ members, onRefreshMembers, onNaviga
     setTimeout(() => setSyncSuccessMsg(''), 4000);
   };
 
-  // 7. LOAD PAST SESSIONS FOR CORRECTION
+  // 7. DOWNLOAD EXACT ATTENDANCE REPORT CSV
+  const handleDownloadAttendanceCSV = () => {
+    if (!syncedSessionCorrection) return;
+
+    const presentRows = syncedSessionCorrection.rows.filter(r => r.status === 'present');
+    const absentRows = syncedSessionCorrection.rows.filter(r => r.status !== 'present');
+    const totalRoster = syncedSessionCorrection.rows.length;
+    const rate = totalRoster > 0 ? Math.round((presentRows.length / totalRoster) * 100) : 0;
+
+    // Strict alphabetical order: Present members first (A-Z), Absent members next (A-Z)
+    const sortedExportRows = [
+      ...presentRows.slice().sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' })),
+      ...absentRows.slice().sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }))
+    ];
+
+    const headers = [
+      'S/N',
+      'Attendance Status',
+      'Member / Attendee Name',
+      'Member Type',
+      'WhatsApp Community',
+      'Phone Number',
+      'Email',
+      'Prayer Minutes',
+      'Attendance Source',
+      'Session Date'
+    ];
+
+    let sn = 1;
+    const csvRows = sortedExportRows.map(r => {
+      const isPres = r.status === 'present';
+      const phone = r.matchedMember?.phone || (r.matchedMember as any)?.whatsappNumber || r.matchedMember?.whatsappGroup || '';
+      return [
+        `"${sn++}"`,
+        `"${isPres ? 'PRESENT' : 'ABSENT'}"`,
+        `"${r.name.replace(/"/g, '""')}"`,
+        `"${r.isMember ? 'Registered Member' : 'Guest Visitor'}"`,
+        `"${(r.whatsappCommunity || 'Unassigned').replace(/"/g, '""')}"`,
+        `"${phone.replace(/"/g, '""')}"`,
+        `"${(r.email || '').replace(/"/g, '""')}"`,
+        `"${isPres ? (r.durationMinutes || meetingDurationMinutes) : 0}"`,
+        `"${(r.source || 'Online Prayer').replace(/"/g, '""')}"`,
+        `"${syncedSessionCorrection.date}"`
+      ].join(',');
+    });
+
+    const csvContent = '\uFEFF' + [
+      `"LIGHT UP PRAYER HOUSE — DAILY ONLINE PRAYER ATTENDANCE REPORT"`,
+      `"Session Title: ${syncedSessionCorrection.title.replace(/"/g, '""')}"`,
+      `"Session Date: ${syncedSessionCorrection.date}"`,
+      `"Summary: ${presentRows.length} Present, ${absentRows.length} Absent (${rate}% Attendance Rate)"`,
+      '',
+      headers.join(','),
+      ...csvRows
+    ].join('\r\n');
+
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.setAttribute('href', url);
+    link.setAttribute('download', `LightUp_Daily_Prayer_Attendance_${syncedSessionCorrection.date}.csv`);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+    setSyncSuccessMsg(`📥 Downloaded exact attendance CSV for ${syncedSessionCorrection.date}!`);
+    setTimeout(() => setSyncSuccessMsg(''), 4000);
+  };
+
+  // Export any past session as exact attendance CSV
+  const handleExportSessionCSV = async (session: ZoomSessionItem) => {
+    try {
+      setSyncSuccessMsg(`Generating attendance CSV for ${session.meetingDate}...`);
+      const q = query(collection(db, 'zoom_participant_logs'), where('sessionId', '==', session.id));
+      const snap = await getDocs(q);
+      const sessionLogsList = snap.docs.map(d => ({ id: d.id, ...d.data() })) as ZoomParticipantLog[];
+
+      const rows: SyncedCorrectionRow[] = [];
+      const presentMemberUids = new Set<string>();
+
+      sessionLogsList.forEach(log => {
+        const isPres = log.status !== 'reversed_absent';
+        if (log.memberUid && isPres) presentMemberUids.add(log.memberUid);
+        const mem = members.find(m => m.uid === log.memberUid) || null;
+
+        rows.push({
+          logId: log.id,
+          name: log.name,
+          email: log.email || '',
+          durationMinutes: log.durationMinutes,
+          isMember: !!log.isMember,
+          memberUid: log.memberUid || '',
+          matchedMember: mem,
+          whatsappCommunity: log.whatsappCommunity || (mem ? getMemberWhatsAppCommunity(mem) : ''),
+          date: session.meetingDate,
+          status: isPres ? 'present' : 'reversed_absent',
+          source: (log as any).source || 'manual'
+        });
+      });
+
+      // Add absent members
+      const absentMembers = members.filter(m => {
+        const uid = m.uid || (m as any).id;
+        return uid && !presentMemberUids.has(uid) && !rows.some(r => r.memberUid === uid);
+      });
+
+      absentMembers.forEach(mem => {
+        rows.push({
+          logId: `absent-${mem.uid}-${session.meetingDate}`,
+          name: (mem.displayName || mem.email || 'Member').trim(),
+          email: mem.email || '',
+          durationMinutes: 0,
+          isMember: true,
+          memberUid: mem.uid,
+          matchedMember: mem,
+          whatsappCommunity: getMemberWhatsAppCommunity(mem),
+          date: session.meetingDate,
+          status: 'reversed_absent',
+          source: 'manual'
+        });
+      });
+
+      const presentRows = rows.filter(r => r.status === 'present');
+      const absentRows = rows.filter(r => r.status !== 'present');
+      const totalRoster = rows.length;
+      const rate = totalRoster > 0 ? Math.round((presentRows.length / totalRoster) * 100) : 0;
+
+      const sortedExportRows = [
+        ...presentRows.slice().sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' })),
+        ...absentRows.slice().sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }))
+      ];
+
+      const headers = [
+        'S/N',
+        'Attendance Status',
+        'Member / Attendee Name',
+        'Member Type',
+        'WhatsApp Community',
+        'Phone Number',
+        'Email',
+        'Prayer Minutes',
+        'Attendance Source',
+        'Session Date'
+      ];
+
+      let sn = 1;
+      const csvRows = sortedExportRows.map(r => {
+        const isPres = r.status === 'present';
+        const phone = r.matchedMember?.phone || (r.matchedMember as any)?.whatsappNumber || r.matchedMember?.whatsappGroup || '';
+        return [
+          `"${sn++}"`,
+          `"${isPres ? 'PRESENT' : 'ABSENT'}"`,
+          `"${r.name.replace(/"/g, '""')}"`,
+          `"${r.isMember ? 'Registered Member' : 'Guest Visitor'}"`,
+          `"${(r.whatsappCommunity || 'Unassigned').replace(/"/g, '""')}"`,
+          `"${phone.replace(/"/g, '""')}"`,
+          `"${(r.email || '').replace(/"/g, '""')}"`,
+          `"${isPres ? (r.durationMinutes || meetingDurationMinutes) : 0}"`,
+          `"${(r.source || 'Online Prayer').replace(/"/g, '""')}"`,
+          `"${session.meetingDate}"`
+        ].join(',');
+      });
+
+      const csvContent = '\uFEFF' + [
+        `"LIGHT UP PRAYER HOUSE — DAILY ONLINE PRAYER ATTENDANCE REPORT"`,
+        `"Session Title: ${session.title.replace(/"/g, '""')}"`,
+        `"Session Date: ${session.meetingDate}"`,
+        `"Summary: ${presentRows.length} Present, ${absentRows.length} Absent (${rate}% Attendance Rate)"`,
+        '',
+        headers.join(','),
+        ...csvRows
+      ].join('\r\n');
+
+      const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.setAttribute('href', url);
+      link.setAttribute('download', `LightUp_Prayer_Attendance_${session.meetingDate}.csv`);
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+      setSyncSuccessMsg(`📥 Downloaded exact attendance CSV for ${session.meetingDate}!`);
+      setTimeout(() => setSyncSuccessMsg(''), 4000);
+    } catch (err: any) {
+      console.error('Error exporting session CSV:', err);
+      alert('Could not export CSV: ' + err?.message);
+    }
+  };
+
+  // 8. LOAD PAST SESSIONS FOR CORRECTION
   const loadPastSessions = async () => {
     setLoadingSessions(true);
     try {
@@ -1367,6 +1557,16 @@ Guest Visitor London 45 mins`;
 
                   <button
                     type="button"
+                    onClick={handleDownloadAttendanceCSV}
+                    className="flex items-center space-x-1.5 px-4 py-2.5 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-xs font-black uppercase tracking-wider transition-all cursor-pointer shadow-sm"
+                    title="Download exact attendance CSV report (Present first A-Z, Absent next A-Z)"
+                  >
+                    <Download size={14} />
+                    <span>Download Attendance CSV</span>
+                  </button>
+
+                  <button
+                    type="button"
                     onClick={handleCopyWhatsAppSummary}
                     className="flex items-center space-x-1.5 px-4 py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-black uppercase tracking-wider transition-all cursor-pointer shadow-sm"
                     title="Copy formatted WhatsApp attendance report"
@@ -1744,13 +1944,24 @@ Guest Visitor London 45 mins`;
                       <span>Total Time: <strong className="text-[#F26522]">{session.totalMinutes} mins</strong></span>
                     </div>
 
-                    <button
-                      onClick={() => handleLoadSessionForCorrection(session)}
-                      className="w-full flex items-center justify-center space-x-2 py-3 bg-[#1A1F3C] hover:bg-[#282E5C] text-white rounded-xl text-xs font-black uppercase tracking-wider transition-all cursor-pointer shadow-md"
-                    >
-                      <UserCheck size={14} />
-                      <span>Open for Manual Correction</span>
-                    </button>
+                    <div className="flex items-center space-x-2">
+                      <button
+                        onClick={() => handleLoadSessionForCorrection(session)}
+                        className="flex-1 flex items-center justify-center space-x-1.5 py-2.5 bg-[#1A1F3C] hover:bg-[#282E5C] text-white rounded-xl text-xs font-black uppercase tracking-wider transition-all cursor-pointer shadow-md"
+                      >
+                        <UserCheck size={14} />
+                        <span>Manual Correction</span>
+                      </button>
+
+                      <button
+                        onClick={() => handleExportSessionCSV(session)}
+                        className="flex items-center justify-center space-x-1 px-3 py-2.5 bg-blue-50 hover:bg-blue-100 text-blue-700 border border-blue-200 rounded-xl text-xs font-black uppercase tracking-wider transition-all cursor-pointer"
+                        title="Download exact attendance CSV for this session"
+                      >
+                        <Download size={14} />
+                        <span>CSV</span>
+                      </button>
+                    </div>
                   </div>
                 </div>
               ))}
