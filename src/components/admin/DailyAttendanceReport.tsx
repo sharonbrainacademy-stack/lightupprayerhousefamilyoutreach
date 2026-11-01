@@ -12,16 +12,19 @@ import {
   RefreshCw, ChevronDown, UserCheck, Bot,
   CheckSquare, Square, Zap, Upload, ShieldCheck,
   ChevronRight, ChevronLeft, CheckCheck, ListFilter, SlidersHorizontal,
-  LayoutGrid, Table as TableIcon, HeartHandshake
+  LayoutGrid, Table as TableIcon, HeartHandshake, Trash2
 } from 'lucide-react';
 import { 
   doc, updateDoc, arrayUnion, arrayRemove, 
   increment, writeBatch, getDoc, collection, 
-  query, where, onSnapshot 
+  query, where, onSnapshot, setDoc, serverTimestamp, deleteDoc 
 } from 'firebase/firestore';
 import { db } from '../../lib/firebase';
 import { UserProfile, ZoomParticipantLog } from '../../types';
-import { getTodayDateString } from '../../lib/attendance';
+import { 
+  getTodayDateString, findMemberForGuestLog, 
+  isAttendeeMatchingMember, purgeDuplicateGuestZoomLogs 
+} from '../../lib/attendance';
 import { getMemberWhatsAppCommunity, WHATSAPP_COMMUNITY_OPTIONS } from '../../lib/whatsapp';
 import { cn } from '../../lib/utils';
 import { ManualAttendanceModal } from './ManualAttendanceModal';
@@ -34,14 +37,27 @@ interface DailyAttendanceReportProps {
   initialDate?: string;
 }
 
-interface MemberAttendanceRow {
-  member: UserProfile;
+export interface MemberAttendanceRow {
+  member: UserProfile | null;
+  uid: string;
   isPresent: boolean;
   minutes: number;
   displayName: string;
   phone: string;
   email: string;
   community: string;
+  isGuest: boolean;
+  logId?: string;
+}
+
+export interface GroupAttendanceBlock {
+  groupName: string;
+  total: number;
+  presentCount: number;
+  absentCount: number;
+  attendanceRate: number;
+  presentList: MemberAttendanceRow[];
+  absentList: MemberAttendanceRow[];
 }
 
 export default function DailyAttendanceReport({ 
@@ -124,6 +140,39 @@ export default function DailyAttendanceReport({
   const [manualModalMember, setManualModalMember] = useState<UserProfile | null>(null);
   const [manualModalSuccessBanner, setManualModalSuccessBanner] = useState<string | null>(null);
 
+  // Guest logs auto-purge & clean state
+  const [isPurgingGuests, setIsPurgingGuests] = useState(false);
+  const [purgeFeedback, setPurgeFeedback] = useState<string | null>(null);
+
+  // Auto purge duplicate guest logs when members change or selected date changes
+  useEffect(() => {
+    if (members && members.length > 0) {
+      purgeDuplicateGuestZoomLogs(members, selectedDate).catch(err => {
+        console.warn('Auto-purge guest logs error:', err);
+      });
+    }
+  }, [members, selectedDate]);
+
+  const handleManualPurgeGuestLogs = async () => {
+    if (!members || members.length === 0) return;
+    setIsPurgingGuests(true);
+    setPurgeFeedback(null);
+    try {
+      const result = await purgeDuplicateGuestZoomLogs(members, selectedDate);
+      if (result.deletedCount > 0) {
+        setPurgeFeedback(`Successfully cleaned ${result.deletedCount} guest log${result.deletedCount > 1 ? 's' : ''} matched to prayer group members!`);
+      } else {
+        setPurgeFeedback(`All guest logs are clean. No group members found in unregistered logs.`);
+      }
+    } catch (err: any) {
+      console.error('Error cleaning guest logs:', err);
+      setPurgeFeedback('Failed to clean guest logs.');
+    } finally {
+      setIsPurgingGuests(false);
+      setTimeout(() => setPurgeFeedback(null), 5000);
+    }
+  };
+
   // Collect all unique communities across registered members + default list
   const allCommunities = useMemo(() => {
     const set = new Set<string>(WHATSAPP_COMMUNITY_OPTIONS);
@@ -165,83 +214,156 @@ export default function DailyAttendanceReport({
   }, [members, todayStr]);
 
   // Helper to determine if a member was present on a given date (prioritizes sessionLogs)
-  const checkMemberPresentOnDate = (m: UserProfile, dateStr: string): { isPresent: boolean; minutes: number } => {
+  const checkMemberPresentOnDate = (m: UserProfile, dateStr: string): { isPresent: boolean; minutes: number; logId?: string } => {
     // 1. Check if there is an explicit participant log in sessionLogs for this member on this date
     if (sessionLogs.length > 0) {
       const memberLog = sessionLogs.find(l => 
         (l.memberUid && l.memberUid === m.uid) || 
-        (l.email && m.email && l.email.toLowerCase().trim() === m.email.toLowerCase().trim())
+        (l.email && m.email && l.email.toLowerCase().trim() === m.email.toLowerCase().trim()) ||
+        isAttendeeMatchingMember(l.name, l.email, (l as any).phone, m)
       );
       if (memberLog) {
         if (memberLog.status === 'reversed_absent') {
-          return { isPresent: false, minutes: 0 };
+          return { isPresent: false, minutes: 0, logId: memberLog.id };
         }
-        return { isPresent: true, minutes: memberLog.durationMinutes || 60 };
+        return { isPresent: true, minutes: memberLog.durationMinutes || 60, logId: memberLog.id };
       }
     }
 
     // 2. Check member profile attendanceDaysList & dailyMinutes
     const hasInDaysList = Array.isArray(m.attendanceDaysList) && m.attendanceDaysList.includes(dateStr);
     const recordedMins = m.dailyMinutes?.[dateStr] || 0;
-    const isPresent = Boolean(hasInDaysList || recordedMins > 0);
-    const minutes = recordedMins > 0 ? recordedMins : (isPresent ? 60 : 0);
+    const isPresent = Boolean(hasInDaysList || recordedMins > 0 || (dateStr === todayStr && (m.todayMinutes || 0) > 0));
+    const minutes = recordedMins > 0 ? recordedMins : (isPresent ? (m.todayMinutes || 60) : 0);
 
     return { isPresent, minutes };
   };
 
-  // Build rows for a given group (or all) and enforce strict sorting:
-  // Present members first (alphabetical), then Absent members (alphabetical)
+  // Build rows enforcing strict hierarchy:
+  // 1. Group by group: each group shows Present members (A-Z) then Absent members (A-Z)
+  // 2. Lastly: Unregistered members / guest attendees (A-Z)
   const getProcessedRosterForGroup = (groupName: string, targetDate = selectedDate) => {
-    const groupMembers = members.filter(m => {
-      if (groupName === 'all') return true;
-      const comm = getMemberWhatsAppCommunity(m);
-      if (groupName === 'Unassigned') return comm === 'Unassigned';
-      return comm.toLowerCase().trim() === groupName.toLowerCase().trim() ||
-             (m.whatsappCommunity || '').toLowerCase().trim() === groupName.toLowerCase().trim() ||
-             (m.whatsappGroupName || '').toLowerCase().trim() === groupName.toLowerCase().trim();
+    // Determine the list of community groups to include
+    let targetCommunities: string[] = [];
+    if (groupName === 'all') {
+      const defaultOrder = [...WHATSAPP_COMMUNITY_OPTIONS];
+      const customSet = new Set<string>();
+      members.forEach(m => {
+        const comm = getMemberWhatsAppCommunity(m);
+        if (comm && comm !== 'Unassigned' && !defaultOrder.includes(comm)) {
+          customSet.add(comm);
+        }
+      });
+      const customList = Array.from(customSet).sort();
+      targetCommunities = [...defaultOrder, ...customList];
+      if (members.some(m => getMemberWhatsAppCommunity(m) === 'Unassigned')) {
+        targetCommunities.push('Unassigned');
+      }
+    } else {
+      targetCommunities = [groupName];
+    }
+
+    const groupsData: GroupAttendanceBlock[] = [];
+    const allRegisteredRows: MemberAttendanceRow[] = [];
+
+    targetCommunities.forEach(commName => {
+      const commMembers = members.filter(m => {
+        const c = getMemberWhatsAppCommunity(m);
+        if (commName === 'Unassigned') return c === 'Unassigned';
+        return c.toLowerCase().trim() === commName.toLowerCase().trim() ||
+               (m.whatsappCommunity || '').toLowerCase().trim() === commName.toLowerCase().trim() ||
+               (m.whatsappGroupName || '').toLowerCase().trim() === commName.toLowerCase().trim();
+      });
+
+      const memberRows: MemberAttendanceRow[] = commMembers.map(m => {
+        const { isPresent, minutes, logId } = checkMemberPresentOnDate(m, targetDate);
+        return {
+          member: m,
+          uid: m.uid,
+          isPresent,
+          minutes,
+          displayName: (m.displayName || '').trim() || m.email || 'Unnamed Member',
+          phone: m.phone || m.whatsappGroup || '',
+          email: m.email || '',
+          community: getMemberWhatsAppCommunity(m),
+          isGuest: false,
+          logId
+        };
+      });
+
+      const presentList = memberRows.filter(r => r.isPresent);
+      const absentList = memberRows.filter(r => !r.isPresent);
+
+      presentList.sort((a, b) => a.displayName.localeCompare(b.displayName, undefined, { sensitivity: 'base' }));
+      absentList.sort((a, b) => a.displayName.localeCompare(b.displayName, undefined, { sensitivity: 'base' }));
+
+      groupsData.push({
+        groupName: commName,
+        total: memberRows.length,
+        presentCount: presentList.length,
+        absentCount: absentList.length,
+        attendanceRate: memberRows.length > 0 ? Math.round((presentList.length / memberRows.length) * 100) : 0,
+        presentList,
+        absentList
+      });
+
+      allRegisteredRows.push(...presentList, ...absentList);
     });
 
-    const rows: MemberAttendanceRow[] = groupMembers.map(m => {
-      const { isPresent, minutes } = checkMemberPresentOnDate(m, targetDate);
-      return {
-        member: m,
-        isPresent,
-        minutes,
-        displayName: (m.displayName || '').trim() || m.email || 'Unnamed Member',
-        phone: m.phone || m.whatsappGroup || '',
-        email: m.email || '',
-        community: getMemberWhatsAppCommunity(m)
-      };
+    // Unregistered guest attendees for targetDate
+    // CRITICAL: Any member whose name is under guest/unregistered zoom log, once found in ANY group,
+    // is automatically deleted from Firestore zoom_participant_logs and excluded from guest/unregistered list!
+    const validGuestLogs = sessionLogs.filter(l => {
+      if (l.isMember || l.memberUid || l.status === 'reversed_absent') return false;
+      const matched = findMemberForGuestLog({ name: l.name, email: l.email, phone: (l as any).phone }, members);
+      if (matched) {
+        // Automatically delete from zoom_participant_logs in Firestore
+        if (l.id) {
+          deleteDoc(doc(db, 'zoom_participant_logs', l.id)).catch(err => {
+            console.warn('Auto-deleted guest log for member found in group:', l.id, err);
+          });
+        }
+        return false;
+      }
+      return true;
     });
 
-    // Also include guest visitors who attended on this date
-    const guestLogs = sessionLogs.filter(l => !l.isMember && l.status !== 'reversed_absent');
-    const guestRows: MemberAttendanceRow[] = (groupName === 'all' || groupName === 'Unassigned') ? guestLogs.map(g => ({
-      member: null as any,
+    const guestRows: MemberAttendanceRow[] = (groupName === 'all' || groupName === 'Unassigned') ? validGuestLogs.map((g, idx) => ({
+      member: null,
+      uid: g.id || `guest-${idx}-${g.name}`,
       isPresent: true,
       minutes: g.durationMinutes || 60,
-      displayName: g.name,
+      displayName: g.name || 'Anonymous Visitor',
       phone: '',
       email: g.email || '',
-      community: g.whatsappCommunity || 'Guest Visitor'
+      community: g.whatsappCommunity || 'Unregistered Attendee',
+      isGuest: true,
+      logId: g.id
     })) : [];
 
-    const allRows = [...rows, ...guestRows];
-    const presentList = allRows.filter(r => r.isPresent);
-    const absentList = allRows.filter(r => !r.isPresent);
+    guestRows.sort((a, b) => a.displayName.localeCompare(b.displayName, undefined, { sensitivity: 'base' }));
 
-    presentList.sort((a, b) => a.displayName.localeCompare(b.displayName, undefined, { sensitivity: 'base' }));
-    absentList.sort((a, b) => a.displayName.localeCompare(b.displayName, undefined, { sensitivity: 'base' }));
+    // Strict unified sequence:
+    // 1. Group by group (for each group: Present A-Z, then Absent A-Z)
+    // 2. Lastly: Unregistered members (A-Z)
+    const sortedUnified: MemberAttendanceRow[] = [...allRegisteredRows, ...guestRows];
 
-    const sortedUnified = [...presentList, ...absentList];
+    const presentCount = sortedUnified.filter(r => r.isPresent).length;
+    const absentCount = sortedUnified.filter(r => !r.isPresent).length;
+    const totalCount = sortedUnified.length;
+    const attendanceRate = totalCount > 0 ? Math.round((presentCount / totalCount) * 100) : 0;
 
     return {
-      total: allRows.length,
-      presentCount: presentList.length,
-      absentCount: absentList.length,
-      attendanceRate: allRows.length > 0 ? Math.round((presentList.length / allRows.length) * 100) : 0,
-      presentList,
-      absentList,
+      total: totalCount,
+      totalRegistered: members.length,
+      unregisteredCount: guestRows.length,
+      presentCount,
+      absentCount,
+      attendanceRate,
+      presentList: sortedUnified.filter(r => r.isPresent),
+      absentList: sortedUnified.filter(r => !r.isPresent),
+      unregisteredGuestsList: guestRows,
+      groupsData,
       sortedUnified
     };
   };
@@ -300,8 +422,11 @@ export default function DailyAttendanceReport({
 
   // Toggle or explicitly set single member attendance status directly
   const handleToggleAttendance = async (row: MemberAttendanceRow, forceTargetStatus?: 'present' | 'absent') => {
-    const uid = row.member.uid;
-    if (!uid) return;
+    const isGuest = row.isGuest;
+    const uid = row.member?.uid || (!isGuest ? row.uid : null);
+    const logId = row.logId;
+
+    if (!uid && !isGuest && !logId) return;
 
     if (forceTargetStatus) {
       if (forceTargetStatus === 'present' && row.isPresent) return;
@@ -309,48 +434,92 @@ export default function DailyAttendanceReport({
     }
 
     const shouldMarkAbsent = forceTargetStatus ? forceTargetStatus === 'absent' : row.isPresent;
+    const targetStatusStr = shouldMarkAbsent ? 'absent' : 'present';
 
-    setIsUpdatingMemberId(uid);
+    setIsUpdatingMemberId(row.uid);
     try {
-      const userRef = doc(db, 'users', uid);
-      const currentDays = Array.isArray(row.member.attendanceDaysList) ? [...row.member.attendanceDaysList] : [];
-      const currentDailyMap = row.member.dailyMinutes ? { ...row.member.dailyMinutes } : {};
-
-      if (shouldMarkAbsent) {
-        // Mark as ABSENT
-        const newDays = currentDays.filter(d => d !== selectedDate);
-        delete currentDailyMap[selectedDate];
-
-        await updateDoc(userRef, {
-          attendanceDaysList: arrayRemove(selectedDate),
-          attendanceCount: Math.max(0, (row.member.attendanceCount || currentDays.length) - 1),
-          totalMinutes: Math.max(0, (row.member.totalMinutes || 0) - (row.minutes || 60)),
-          dailyMinutes: currentDailyMap,
-          manualAdjustmentNote: `Marked absent on ${new Date().toLocaleDateString()}`,
-          ...(selectedDate === todayStr ? { todayMinutes: 0 } : {})
+      // 1. If guest visitor, update zoom_participant_logs directly
+      if (isGuest && logId) {
+        await updateDoc(doc(db, 'zoom_participant_logs', logId), {
+          status: shouldMarkAbsent ? 'reversed_absent' : 'present',
+          durationMinutes: shouldMarkAbsent ? 0 : (row.minutes || 60)
         });
-        setManualModalSuccessBanner(`Marked ${row.displayName} as ABSENT for ${selectedDate}.`);
-      } else {
-        // Mark as PRESENT
-        const isNewDay = !currentDays.includes(selectedDate);
-        currentDailyMap[selectedDate] = currentDailyMap[selectedDate] || 60;
-
-        await updateDoc(userRef, {
-          attendanceDaysList: arrayUnion(selectedDate),
-          lastAttendedDate: selectedDate,
-          attendanceCount: increment(isNewDay ? 1 : 0),
-          totalMinutes: (row.member.totalMinutes || 0) + (currentDailyMap[selectedDate] || 60),
-          dailyMinutes: currentDailyMap,
-          manualAdjustmentNote: `Marked present on ${new Date().toLocaleDateString()}`,
-          ...(selectedDate === todayStr ? { todayMinutes: currentDailyMap[selectedDate] } : {})
-        });
-        setManualModalSuccessBanner(`Marked ${row.displayName} as PRESENT for ${selectedDate}.`);
+        setManualModalSuccessBanner(`Marked visitor "${row.displayName}" as ${targetStatusStr.toUpperCase()} for ${selectedDate}.`);
+        setTimeout(() => setManualModalSuccessBanner(null), 4000);
+        return;
       }
 
-      setTimeout(() => setManualModalSuccessBanner(null), 4000);
+      // 2. If registered member, update both users doc AND any zoom_participant_logs doc
+      if (uid && row.member) {
+        const userRef = doc(db, 'users', uid);
+        const currentDays = Array.isArray(row.member.attendanceDaysList) ? [...row.member.attendanceDaysList] : [];
+        const currentDailyMap = row.member.dailyMinutes ? { ...row.member.dailyMinutes } : {};
+
+        if (shouldMarkAbsent) {
+          // Mark as ABSENT
+          delete currentDailyMap[selectedDate];
+
+          await updateDoc(userRef, {
+            attendanceDaysList: arrayRemove(selectedDate),
+            attendanceCount: Math.max(0, (row.member.attendanceCount || currentDays.length) - 1),
+            totalMinutes: Math.max(0, (row.member.totalMinutes || 0) - (row.minutes || 60)),
+            dailyMinutes: currentDailyMap,
+            manualAdjustmentNote: `Marked absent on ${new Date().toLocaleDateString()}`,
+            ...(selectedDate === todayStr ? { todayMinutes: 0 } : {})
+          });
+        } else {
+          // Mark as PRESENT
+          const isNewDay = !currentDays.includes(selectedDate);
+          currentDailyMap[selectedDate] = currentDailyMap[selectedDate] || (row.minutes > 0 ? row.minutes : 60);
+
+          await updateDoc(userRef, {
+            attendanceDaysList: arrayUnion(selectedDate),
+            lastAttendedDate: selectedDate,
+            attendanceCount: increment(isNewDay ? 1 : 0),
+            totalMinutes: (row.member.totalMinutes || 0) + currentDailyMap[selectedDate],
+            dailyMinutes: currentDailyMap,
+            manualAdjustmentNote: `Marked present on ${new Date().toLocaleDateString()}`,
+            ...(selectedDate === todayStr ? { todayMinutes: currentDailyMap[selectedDate] } : {})
+          });
+        }
+
+        // Synchronize matching zoom_participant_logs doc for this member on selectedDate
+        const existingLog = sessionLogs.find(l => 
+          (l.memberUid && l.memberUid === uid) ||
+          (l.email && row.email && l.email.toLowerCase().trim() === row.email.toLowerCase().trim())
+        );
+
+        if (existingLog && existingLog.id) {
+          await updateDoc(doc(db, 'zoom_participant_logs', existingLog.id), {
+            status: shouldMarkAbsent ? 'reversed_absent' : 'present',
+            durationMinutes: shouldMarkAbsent ? 0 : (currentDailyMap[selectedDate] || 60)
+          });
+        } else if (!shouldMarkAbsent) {
+          const newLogRef = doc(collection(db, 'zoom_participant_logs'));
+          await setDoc(newLogRef, {
+            sessionId: `manual-${selectedDate}`,
+            sessionTitle: 'Daily Online Prayer Meeting',
+            name: row.displayName,
+            email: row.email || '',
+            durationMinutes: currentDailyMap[selectedDate] || 60,
+            date: selectedDate,
+            isMember: true,
+            memberUid: uid,
+            whatsappCommunity: row.community,
+            status: 'present',
+            source: 'manual',
+            createdAt: serverTimestamp()
+          });
+        }
+
+        setManualModalSuccessBanner(`Marked ${row.displayName} as ${targetStatusStr.toUpperCase()} for ${selectedDate}.`);
+        setTimeout(() => setManualModalSuccessBanner(null), 4000);
+      }
+
       if (onRefreshMembers) onRefreshMembers();
-    } catch (err) {
+    } catch (err: any) {
       console.error('Failed to update attendance:', err);
+      alert('Failed to update attendance: ' + err?.message);
     } finally {
       setIsUpdatingMemberId(null);
     }
@@ -388,6 +557,15 @@ export default function DailyAttendanceReport({
             dailyMinutes: currentDailyMap,
             manualAdjustmentNote: `Batch marked absent on ${new Date().toLocaleDateString()}`,
             ...(dateToApply === todayStr ? { todayMinutes: 0 } : {})
+          });
+        }
+
+        // Also update matching log if present
+        const existingLog = sessionLogs.find(l => l.memberUid === uid);
+        if (existingLog && existingLog.id) {
+          batch.update(doc(db, 'zoom_participant_logs', existingLog.id), {
+            status: targetStatus === 'present' ? 'present' : 'reversed_absent',
+            durationMinutes: targetStatus === 'present' ? 60 : 0
           });
         }
       }
@@ -431,6 +609,32 @@ export default function DailyAttendanceReport({
           manualAdjustmentNote: `Quick inline marked present on ${new Date().toLocaleDateString()}`,
           ...(selectedDate === todayStr ? { todayMinutes: Number(quickMarkerMinutes) || 60 } : {})
         });
+
+        // Also sync participant log
+        const existingLog = sessionLogs.find(l => l.memberUid === quickMarkerMemberId);
+        if (existingLog && existingLog.id) {
+          await updateDoc(doc(db, 'zoom_participant_logs', existingLog.id), {
+            status: 'present',
+            durationMinutes: Number(quickMarkerMinutes) || 60
+          });
+        } else {
+          const newLogRef = doc(collection(db, 'zoom_participant_logs'));
+          await setDoc(newLogRef, {
+            sessionId: `manual-${selectedDate}`,
+            sessionTitle: 'Daily Online Prayer Meeting',
+            name: targetMember.displayName || targetMember.email || 'Member',
+            email: targetMember.email || '',
+            durationMinutes: Number(quickMarkerMinutes) || 60,
+            date: selectedDate,
+            isMember: true,
+            memberUid: quickMarkerMemberId,
+            whatsappCommunity: getMemberWhatsAppCommunity(targetMember),
+            status: 'present',
+            source: 'manual',
+            createdAt: serverTimestamp()
+          });
+        }
+
         setManualModalSuccessBanner(`Quick marked ${targetMember.displayName || 'Member'} as PRESENT (${quickMarkerMinutes}m) for ${selectedDate}!`);
       } else {
         delete currentDailyMap[selectedDate];
@@ -441,6 +645,15 @@ export default function DailyAttendanceReport({
           manualAdjustmentNote: `Quick inline marked absent on ${new Date().toLocaleDateString()}`,
           ...(selectedDate === todayStr ? { todayMinutes: 0 } : {})
         });
+
+        const existingLog = sessionLogs.find(l => l.memberUid === quickMarkerMemberId);
+        if (existingLog && existingLog.id) {
+          await updateDoc(doc(db, 'zoom_participant_logs', existingLog.id), {
+            status: 'reversed_absent',
+            durationMinutes: 0
+          });
+        }
+
         setManualModalSuccessBanner(`Quick marked ${targetMember.displayName || 'Member'} as ABSENT for ${selectedDate}!`);
       }
 
@@ -457,17 +670,17 @@ export default function DailyAttendanceReport({
     }
   };
 
-  // Export CSV strictly formatted with Present first then Absent (both alphabetical)
+  // Export CSV strictly formatted group by group: Present first (A-Z) then Absent (A-Z), lastly Unregistered members (A-Z)
   const handleExportCSV = (groupToExport = selectedGroup) => {
     const reportData = getProcessedRosterForGroup(groupToExport, selectedDate);
     const groupLabel = groupToExport === 'all' ? 'All Prayer Groups' : groupToExport;
 
     const headers = [
       'S/N',
+      'Community / Group',
       'Attendance Status',
       'Member / Attendee Name',
       'Member Type',
-      'WhatsApp Group / Community',
       'Phone Number',
       'Email',
       'Prayer Minutes',
@@ -477,10 +690,10 @@ export default function DailyAttendanceReport({
     let sn = 1;
     const rows = reportData.sortedUnified.map(r => [
       `"${sn++}"`,
-      `"${r.isPresent ? 'PRESENT' : 'ABSENT'}"`,
-      `"${r.displayName.replace(/"/g, '""')}"`,
-      `"${r.member ? 'Registered Member' : 'Guest Visitor'}"`,
       `"${r.community.replace(/"/g, '""')}"`,
+      `"${r.isGuest ? 'UNREGISTERED ATTENDEE' : (r.isPresent ? 'PRESENT' : 'ABSENT')}"`,
+      `"${r.displayName.replace(/"/g, '""')}"`,
+      `"${r.isGuest ? 'Unregistered Visitor' : 'Registered Member'}"`,
       `"${(r.phone || '').replace(/"/g, '""')}"`,
       `"${(r.email || '').replace(/"/g, '""')}"`,
       `"${r.isPresent ? (r.minutes || 60) : 0}"`,
@@ -492,6 +705,7 @@ export default function DailyAttendanceReport({
       `"Date: ${selectedDate} (${formattedDateTitle})"`,
       `"Prayer Group: ${groupLabel}"`,
       `"Summary: ${reportData.presentCount} Present, ${reportData.absentCount} Absent (${reportData.attendanceRate}% Attendance Rate)"`,
+      `"Hierarchy: Group by Group (Present A-Z, Absent A-Z), lastly Unregistered Attendees"`,
       '',
       headers.join(','),
       ...rows.map(r => r.join(','))
@@ -509,7 +723,7 @@ export default function DailyAttendanceReport({
     URL.revokeObjectURL(url);
   };
 
-  // Generate WhatsApp formatted report
+  // Generate WhatsApp formatted report group by group: Present first (A-Z) then Absent (A-Z), lastly Unregistered attendees
   const generateWhatsAppReportText = (groupToGenerate = selectedGroup) => {
     const reportData = getProcessedRosterForGroup(groupToGenerate, selectedDate);
     const groupLabel = groupToGenerate === 'all' ? 'All Prayer Groups' : groupToGenerate;
@@ -519,39 +733,97 @@ export default function DailyAttendanceReport({
     lines.push(`📅 *Date:* ${formattedDateTitle} (${selectedDate})`);
     lines.push(`👥 *Group:* ${groupLabel}`);
     lines.push(`📊 *Summary:* ${reportData.presentCount} Present | ${reportData.absentCount} Absent (${reportData.attendanceRate}% Attendance Rate)`);
-    lines.push(`⏱️ *Total Members Registered:* ${reportData.total}`);
+    lines.push(`⏱️ *Total Registered Members:* ${reportData.totalRegistered}`);
+    if (reportData.unregisteredCount > 0) {
+      lines.push(`👤 *Unregistered Attendees / Visitors:* ${reportData.unregisteredCount}`);
+    }
     lines.push(``);
 
-    // 1. PRESENT MEMBERS (Alphabetical)
-    lines.push(`━━━━━━━━━━━━━━━━━━━━━`);
-    lines.push(`✅ *PRESENT MEMBERS (${reportData.presentCount})* — Alphabetical:`);
-    lines.push(`━━━━━━━━━━━━━━━━━━━━━`);
-    if (reportData.presentList.length === 0) {
-      lines.push(`_(No members marked present yet for this session)_`);
-    } else {
-      reportData.presentList.forEach((r, idx) => {
-        const phoneStr = r.phone ? ` • ${r.phone}` : '';
-        const minsStr = r.minutes > 0 ? ` (${r.minutes}m)` : '';
-        lines.push(`${idx + 1}. *${r.displayName}*${phoneStr}${minsStr}`);
+    if (groupToGenerate === 'all') {
+      // Group by group report
+      reportData.groupsData.forEach(g => {
+        if (g.total === 0) return;
+        lines.push(`━━━━━━━━━━━━━━━━━━━━━`);
+        lines.push(`🏛️ *${g.groupName.toUpperCase()}* (${g.presentCount} Present, ${g.absentCount} Absent)`);
+        lines.push(`━━━━━━━━━━━━━━━━━━━━━`);
+
+        lines.push(`✅ *PRESENT (${g.presentCount})* — Alphabetical:`);
+        if (g.presentList.length === 0) {
+          lines.push(`_(No members marked present yet)_`);
+        } else {
+          g.presentList.forEach((r, idx) => {
+            const phoneStr = r.phone ? ` • ${r.phone}` : '';
+            const minsStr = r.minutes > 0 ? ` (${r.minutes}m)` : '';
+            lines.push(`${idx + 1}. *${r.displayName}*${phoneStr}${minsStr}`);
+          });
+        }
+        lines.push(``);
+
+        lines.push(`❌ *ABSENT (${g.absentCount})* — Alphabetical:`);
+        if (g.absentList.length === 0) {
+          lines.push(`_🎉 100% Attendance for this group!_`);
+        } else {
+          g.absentList.forEach((r, idx) => {
+            const phoneStr = r.phone ? ` • ${r.phone}` : '';
+            lines.push(`${idx + 1}. ${r.displayName}${phoneStr}`);
+          });
+        }
+        lines.push(``);
       });
+
+      // Lastly: Unregistered Attendees
+      if (reportData.unregisteredGuestsList.length > 0) {
+        lines.push(`━━━━━━━━━━━━━━━━━━━━━`);
+        lines.push(`👤 *UNREGISTERED ATTENDEES & GUESTS (${reportData.unregisteredGuestsList.length})* — Alphabetical:`);
+        lines.push(`━━━━━━━━━━━━━━━━━━━━━`);
+        reportData.unregisteredGuestsList.forEach((g, idx) => {
+          const minsStr = g.minutes > 0 ? ` (${g.minutes}m)` : '';
+          const emailStr = g.email ? ` • ${g.email}` : '';
+          lines.push(`${idx + 1}. *${g.displayName}* (Visitor)${emailStr}${minsStr}`);
+        });
+        lines.push(``);
+      }
+    } else {
+      // Single group report
+      lines.push(`━━━━━━━━━━━━━━━━━━━━━`);
+      lines.push(`✅ *PRESENT MEMBERS (${reportData.presentCount})* — Alphabetical:`);
+      lines.push(`━━━━━━━━━━━━━━━━━━━━━`);
+      if (reportData.presentList.length === 0) {
+        lines.push(`_(No members marked present yet)_`);
+      } else {
+        reportData.presentList.forEach((r, idx) => {
+          const phoneStr = r.phone ? ` • ${r.phone}` : '';
+          const minsStr = r.minutes > 0 ? ` (${r.minutes}m)` : '';
+          lines.push(`${idx + 1}. *${r.displayName}*${phoneStr}${minsStr}`);
+        });
+      }
+      lines.push(``);
+
+      lines.push(`━━━━━━━━━━━━━━━━━━━━━`);
+      lines.push(`❌ *ABSENT MEMBERS (${reportData.absentCount})* — Alphabetical:`);
+      lines.push(`━━━━━━━━━━━━━━━━━━━━━`);
+      if (reportData.absentList.length === 0) {
+        lines.push(`_🎉 100% Attendance! All registered members in ${groupLabel} were present!_`);
+      } else {
+        reportData.absentList.forEach((r, idx) => {
+          const phoneStr = r.phone ? ` • ${r.phone}` : '';
+          lines.push(`${idx + 1}. ${r.displayName}${phoneStr}`);
+        });
+      }
+      lines.push(``);
+
+      if (reportData.unregisteredGuestsList.length > 0) {
+        lines.push(`━━━━━━━━━━━━━━━━━━━━━`);
+        lines.push(`👤 *UNREGISTERED ATTENDEES (${reportData.unregisteredGuestsList.length})* — Alphabetical:`);
+        lines.push(`━━━━━━━━━━━━━━━━━━━━━`);
+        reportData.unregisteredGuestsList.forEach((g, idx) => {
+          const minsStr = g.minutes > 0 ? ` (${g.minutes}m)` : '';
+          lines.push(`${idx + 1}. *${g.displayName}* (Visitor)${minsStr}`);
+        });
+        lines.push(``);
+      }
     }
 
-    lines.push(``);
-
-    // 2. ABSENT MEMBERS (Alphabetical)
-    lines.push(`━━━━━━━━━━━━━━━━━━━━━`);
-    lines.push(`❌ *ABSENT MEMBERS (${reportData.absentCount})* — Alphabetical:`);
-    lines.push(`━━━━━━━━━━━━━━━━━━━━━`);
-    if (reportData.absentList.length === 0) {
-      lines.push(`_🎉 100% Attendance! All registered members were present!_`);
-    } else {
-      reportData.absentList.forEach((r, idx) => {
-        const phoneStr = r.phone ? ` • ${r.phone}` : '';
-        lines.push(`${idx + 1}. ${r.displayName}${phoneStr}`);
-      });
-    }
-
-    lines.push(``);
     lines.push(`🕊️ _"They all joined together constantly in prayer..."_ — Acts 1:14`);
     lines.push(`🔗 *Join Prayer Altar:* https://lightupprayer.org/join`);
 
@@ -673,6 +945,22 @@ export default function DailyAttendanceReport({
             </button>
           </div>
         )}
+
+        {/* Purge Feedback Banner */}
+        {purgeFeedback && (
+          <div className="mt-3 p-4 rounded-2xl bg-amber-50 border border-amber-200 flex items-center justify-between text-xs font-black text-amber-900 uppercase tracking-wider animate-in fade-in">
+            <div className="flex items-center space-x-2">
+              <Trash2 size={16} className="text-amber-600 shrink-0" />
+              <span>{purgeFeedback}</span>
+            </div>
+            <button
+              onClick={() => setPurgeFeedback(null)}
+              className="p-1 hover:bg-black/5 rounded-lg text-amber-600 cursor-pointer"
+            >
+              <XCircle size={14} />
+            </button>
+          </div>
+        )}
       </div>
 
       {/* ========================================================================= */}
@@ -749,6 +1037,16 @@ export default function DailyAttendanceReport({
                 >
                   <Download size={15} />
                   <span>Download CSV</span>
+                </button>
+
+                <button
+                  onClick={handleManualPurgeGuestLogs}
+                  disabled={isPurgingGuests}
+                  className="flex items-center space-x-1.5 px-4 py-2.5 bg-amber-600 hover:bg-amber-700 disabled:opacity-50 text-white rounded-xl text-xs font-black uppercase tracking-wider shadow-md shadow-amber-600/20 transition-all cursor-pointer"
+                  title="Purge any guest/unregistered zoom logs that match registered group members"
+                >
+                  <Trash2 size={15} className={isPurgingGuests ? "animate-spin" : ""} />
+                  <span>{isPurgingGuests ? 'Cleaning...' : 'Clean Guest Logs'}</span>
                 </button>
 
                 <button
@@ -1225,16 +1523,16 @@ export default function DailyAttendanceReport({
                           <th className="sticky left-0 top-0 z-30 bg-gray-50 py-3.5 px-3 text-center w-12 min-w-[48px] max-w-[48px] whitespace-nowrap border-b border-gray-200">
                             <input
                               type="checkbox"
-                              checked={displayedRows.length > 0 && selectedRowUids.length === displayedRows.length}
+                              checked={displayedRows.length > 0 && selectedRowUids.length === displayedRows.filter(r => !r.isGuest).length}
                               onChange={(e) => {
                                 if (e.target.checked) {
-                                  setSelectedRowUids(displayedRows.map(r => r.member.uid).filter(Boolean));
+                                  setSelectedRowUids(displayedRows.filter(r => !r.isGuest).map(r => r.uid).filter(Boolean));
                                 } else {
                                   setSelectedRowUids([]);
                                 }
                               }}
                               className="w-4 h-4 rounded text-[#F26522] focus:ring-[#F26522] cursor-pointer"
-                              title="Select all"
+                              title="Select all registered members"
                             />
                           </th>
                           <th className="sticky left-[48px] top-0 z-30 bg-gray-50 py-3.5 px-3 text-center w-12 min-w-[48px] max-w-[48px] whitespace-nowrap border-b border-gray-200">
@@ -1264,53 +1562,75 @@ export default function DailyAttendanceReport({
                           </tr>
                         ) : (
                           displayedRows.map((row, idx) => {
-                            const isUpdating = isUpdatingMemberId === row.member.uid;
-                            const isSelected = selectedRowUids.includes(row.member.uid);
+                            const isUpdating = isUpdatingMemberId === row.uid;
+                            const isSelected = selectedRowUids.includes(row.uid);
                             const stickyBg = isSelected ? "bg-amber-50" : (row.isPresent ? "bg-emerald-50/90" : "bg-white");
 
+                            const prevRow = idx > 0 ? displayedRows[idx - 1] : null;
+                            const isNewGroupSection = selectedGroup === 'all' && !searchQuery.trim() && (!prevRow || prevRow.community !== row.community || (!prevRow.isGuest && row.isGuest));
+
                             return (
-                              <tr 
-                                key={row.member.uid || `${row.displayName}-${idx}`}
-                                className={cn(
-                                  "hover:bg-gray-50/80 transition-colors",
-                                  isSelected ? "bg-amber-50/40" : (row.isPresent ? "bg-emerald-50/20" : "bg-white")
+                              <React.Fragment key={row.uid || `${row.displayName}-${idx}`}>
+                                {isNewGroupSection && (
+                                  <tr className="bg-gradient-to-r from-orange-50/80 via-amber-50/60 to-white text-[#1A1F3C] font-black border-y-2 border-orange-200">
+                                    <td colSpan={10} className="py-2.5 px-4 text-xs tracking-wider uppercase">
+                                      <div className="flex items-center justify-between">
+                                        <div className="flex items-center space-x-2">
+                                          <span className="w-2.5 h-2.5 rounded-full bg-[#F26522]"></span>
+                                          <span className="text-sm font-black text-[#1A1F3C]">
+                                            {row.isGuest ? '👤 UNREGISTERED ATTENDEES & GUESTS' : `🏛️ ${row.community.toUpperCase()}`}
+                                          </span>
+                                        </div>
+                                        <span className="text-[11px] font-bold text-gray-500 normal-case">
+                                          {row.isGuest ? 'Unregistered Visitors (A-Z)' : 'Present first (A-Z), then Absent (A-Z)'}
+                                        </span>
+                                      </div>
+                                    </td>
+                                  </tr>
                                 )}
-                              >
-                                {/* Row Checkbox - Sticky Column 1 */}
-                                <td className={cn("sticky left-0 z-10 py-3.5 px-3 text-center w-12 min-w-[48px] max-w-[48px] whitespace-nowrap", stickyBg)}>
-                                  <input
-                                    type="checkbox"
-                                    checked={isSelected}
-                                    onChange={(e) => {
-                                      const uid = row.member.uid;
-                                      if (!uid) return;
-                                      if (e.target.checked) {
-                                        setSelectedRowUids(prev => [...prev, uid]);
-                                      } else {
-                                        setSelectedRowUids(prev => prev.filter(id => id !== uid));
-                                      }
-                                    }}
-                                    className="w-4 h-4 rounded text-[#F26522] focus:ring-[#F26522] cursor-pointer"
-                                  />
-                                </td>
+                                <tr 
+                                  className={cn(
+                                    "hover:bg-gray-50/80 transition-colors",
+                                    isSelected ? "bg-amber-50/40" : (row.isPresent ? "bg-emerald-50/20" : "bg-white")
+                                  )}
+                                >
+                                  {/* Row Checkbox - Sticky Column 1 */}
+                                  <td className={cn("sticky left-0 z-10 py-3.5 px-3 text-center w-12 min-w-[48px] max-w-[48px] whitespace-nowrap", stickyBg)}>
+                                    <input
+                                      type="checkbox"
+                                      disabled={row.isGuest}
+                                      checked={isSelected}
+                                      onChange={(e) => {
+                                        const uid = row.uid;
+                                        if (!uid || row.isGuest) return;
+                                        if (e.target.checked) {
+                                          setSelectedRowUids(prev => [...prev, uid]);
+                                        } else {
+                                          setSelectedRowUids(prev => prev.filter(id => id !== uid));
+                                        }
+                                      }}
+                                      className="w-4 h-4 rounded text-[#F26522] focus:ring-[#F26522] cursor-pointer disabled:opacity-30"
+                                      title={row.isGuest ? "Unregistered guest" : "Select member"}
+                                    />
+                                  </td>
 
-                                {/* S/N - Sticky Column 2 */}
-                                <td className={cn("sticky left-[48px] z-10 py-3.5 px-3 text-center font-bold text-gray-400 w-12 min-w-[48px] max-w-[48px] whitespace-nowrap", stickyBg)}>
-                                  {idx + 1}
-                                </td>
+                                  {/* S/N - Sticky Column 2 */}
+                                  <td className={cn("sticky left-[48px] z-10 py-3.5 px-3 text-center font-bold text-gray-400 w-12 min-w-[48px] max-w-[48px] whitespace-nowrap", stickyBg)}>
+                                    {idx + 1}
+                                  </td>
 
-                                {/* Attendance Status Badge - Sticky Column 3 */}
-                                <td className={cn("sticky left-[96px] z-10 py-3.5 px-4 whitespace-nowrap min-w-[120px] max-w-[120px]", stickyBg)}>
-                                  {row.isPresent ? (
-                                    <span className="inline-flex items-center space-x-1 px-3 py-1 rounded-full text-[11px] font-black bg-emerald-100 text-emerald-800 border border-emerald-300">
-                                      <CheckCircle2 size={13} className="text-emerald-600 shrink-0" />
-                                      <span>PRESENT</span>
-                                    </span>
-                                  ) : (
-                                    <span className="inline-flex items-center space-x-1 px-3 py-1 rounded-full text-[11px] font-black bg-rose-100 text-rose-800 border border-rose-300">
-                                      <XCircle size={13} className="text-rose-600 shrink-0" />
-                                      <span>ABSENT</span>
-                                    </span>
+                                  {/* Attendance Status Badge - Sticky Column 3 */}
+                                  <td className={cn("sticky left-[96px] z-10 py-3.5 px-4 whitespace-nowrap min-w-[120px] max-w-[120px]", stickyBg)}>
+                                    {row.isPresent ? (
+                                      <span className="inline-flex items-center space-x-1 px-3 py-1 rounded-full text-[11px] font-black bg-emerald-100 text-emerald-800 border border-emerald-300">
+                                        <CheckCircle2 size={13} className="text-emerald-600 shrink-0" />
+                                        <span>PRESENT</span>
+                                      </span>
+                                    ) : (
+                                      <span className="inline-flex items-center space-x-1 px-3 py-1 rounded-full text-[11px] font-black bg-rose-100 text-rose-800 border border-rose-300">
+                                        <XCircle size={13} className="text-rose-600 shrink-0" />
+                                        <span>ABSENT</span>
+                                      </span>
                                   )}
                                 </td>
 
@@ -1492,6 +1812,7 @@ export default function DailyAttendanceReport({
                                   )}
                                 </td>
                               </tr>
+                            </React.Fragment>
                             );
                           })
                         )}
@@ -1510,11 +1831,11 @@ export default function DailyAttendanceReport({
                       </div>
                     ) : (
                       displayedRows.map((row, idx) => {
-                        const isUpdating = isUpdatingMemberId === row.member.uid;
-                        const isSelected = selectedRowUids.includes(row.member.uid);
+                        const isUpdating = isUpdatingMemberId === row.uid;
+                        const isSelected = selectedRowUids.includes(row.uid);
                         return (
                           <div
-                            key={row.member.uid || `${row.displayName}-${idx}`}
+                            key={row.uid || `${row.displayName}-${idx}`}
                             className={cn(
                               "p-4 rounded-2xl border transition-all space-y-3",
                               row.isPresent 
@@ -1527,14 +1848,16 @@ export default function DailyAttendanceReport({
                               <div className="flex items-center space-x-2">
                                 <input
                                   type="checkbox"
+                                  disabled={row.isGuest}
                                   checked={isSelected}
                                   onChange={(e) => {
-                                    const uid = row.member.uid;
-                                    if (!uid) return;
+                                    const uid = row.uid;
+                                    if (!uid || row.isGuest) return;
                                     if (e.target.checked) setSelectedRowUids(prev => [...prev, uid]);
                                     else setSelectedRowUids(prev => prev.filter(id => id !== uid));
                                   }}
-                                  className="w-4 h-4 rounded text-[#F26522] focus:ring-[#F26522] cursor-pointer"
+                                  className="w-4 h-4 rounded text-[#F26522] focus:ring-[#F26522] cursor-pointer disabled:opacity-30"
+                                  title={row.isGuest ? "Unregistered guest" : "Select member"}
                                 />
                                 <span className="text-[11px] font-bold text-gray-400">#{idx + 1}</span>
                                 <span className={cn(
@@ -1619,7 +1942,7 @@ export default function DailyAttendanceReport({
 
                               <button
                                 onClick={() => {
-                                  setManualModalMember(row.member);
+                                  setManualModalMember(row.member || null);
                                   setIsManualModalOpen(true);
                                 }}
                                 className="p-2 bg-gray-100 hover:bg-blue-50 text-gray-600 hover:text-blue-600 rounded-xl transition-colors cursor-pointer shrink-0"
@@ -1743,7 +2066,7 @@ export default function DailyAttendanceReport({
                           <div className="max-h-80 overflow-y-auto space-y-2 pr-1">
                             {report.presentList.map((r, idx) => (
                               <div
-                                key={r.member.uid || idx}
+                                key={r.uid || r.member?.uid || idx}
                                 className="p-2.5 bg-emerald-50/40 rounded-xl border border-emerald-100/60 flex items-center justify-between text-xs"
                               >
                                 <div className="flex items-center space-x-2 min-w-0">
@@ -1792,7 +2115,7 @@ export default function DailyAttendanceReport({
                           <div className="max-h-80 overflow-y-auto space-y-2 pr-1">
                             {report.absentList.map((r, idx) => (
                               <div
-                                key={r.member.uid || idx}
+                                key={r.uid || r.member?.uid || idx}
                                 className="p-2.5 bg-rose-50/30 rounded-xl border border-rose-100/60 flex items-center justify-between text-xs"
                               >
                                 <div className="flex items-center space-x-2 min-w-0">

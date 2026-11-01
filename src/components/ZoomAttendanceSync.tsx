@@ -18,7 +18,10 @@ import {
 } from 'firebase/firestore';
 import { db } from '../lib/firebase';
 import { UserProfile, ZoomSessionItem, ZoomParticipantLog } from '../types';
-import { getTodayDateString } from '../lib/attendance';
+import { 
+  getTodayDateString, findMemberForGuestLog, 
+  isAttendeeMatchingMember, purgeDuplicateGuestZoomLogs 
+} from '../lib/attendance';
 import { cn } from '../lib/utils';
 import { getMemberWhatsAppCommunity, WHATSAPP_COMMUNITY_OPTIONS } from '../lib/whatsapp';
 
@@ -46,6 +49,58 @@ export interface SyncedSessionCorrection {
   totalMinutes: number;
   rows: SyncedCorrectionRow[];
 }
+
+/**
+ * Helper to sort rows group-by-group:
+ * 1. Registered members grouped by community (ordered by WHATSAPP_COMMUNITY_OPTIONS then A-Z)
+ * 2. Within each group: Present members (A-Z) first, then Absent members (A-Z)
+ * 3. Lastly: Unregistered guest attendees (A-Z)
+ */
+export const sortCorrectionRowsByGroupHierarchy = (rows: SyncedCorrectionRow[]): SyncedCorrectionRow[] => {
+  const registered = rows.filter(r => r.isMember);
+  const unregistered = rows.filter(r => !r.isMember);
+
+  const groupsMap = new Map<string, { present: SyncedCorrectionRow[]; absent: SyncedCorrectionRow[] }>();
+
+  registered.forEach(r => {
+    const groupName = r.whatsappCommunity || 'Unassigned';
+    if (!groupsMap.has(groupName)) {
+      groupsMap.set(groupName, { present: [], absent: [] });
+    }
+    const entry = groupsMap.get(groupName)!;
+    if (r.status === 'present') {
+      entry.present.push(r);
+    } else {
+      entry.absent.push(r);
+    }
+  });
+
+  const standardGroups = [...WHATSAPP_COMMUNITY_OPTIONS];
+  const allGroupNames = Array.from(groupsMap.keys()).sort((a, b) => {
+    const idxA = standardGroups.indexOf(a);
+    const idxB = standardGroups.indexOf(b);
+    if (idxA !== -1 && idxB !== -1) return idxA - idxB;
+    if (idxA !== -1) return -1;
+    if (idxB !== -1) return 1;
+    return a.localeCompare(b);
+  });
+
+  const sortedResult: SyncedCorrectionRow[] = [];
+
+  allGroupNames.forEach(grpName => {
+    const entry = groupsMap.get(grpName);
+    if (!entry) return;
+    entry.present.sort((a, b) => (a.name || '').localeCompare(b.name || '', undefined, { sensitivity: 'base' }));
+    entry.absent.sort((a, b) => (a.name || '').localeCompare(b.name || '', undefined, { sensitivity: 'base' }));
+    sortedResult.push(...entry.present, ...entry.absent);
+  });
+
+  // Lastly, unregistered guest attendees sorted A-Z
+  unregistered.sort((a, b) => (a.name || '').localeCompare(b.name || '', undefined, { sensitivity: 'base' }));
+  sortedResult.push(...unregistered);
+
+  return sortedResult;
+};
 
 interface ZoomAttendanceSyncProps {
   members: UserProfile[];
@@ -76,8 +131,40 @@ export default function ZoomAttendanceSync({ members, onRefreshMembers, onNaviga
   const [correctionStatusFilter, setCorrectionStatusFilter] = useState<'all' | 'present' | 'absent' | 'guest'>('all');
   const [correctionCommunityFilter, setCorrectionCommunityFilter] = useState<string>('all');
   const [editingMinutesRowId, setEditingMinutesRowId] = useState<string | null>(null);
-  const [editingMinutesValue, setEditingMinutesValue] = useState<number>(60);
   const [updatingRowId, setUpdatingRowId] = useState<string | null>(null);
+  const [isPurgingGuests, setIsPurgingGuests] = useState(false);
+
+  // Automatically delete any guest/unregistered zoom logs whose name is found in any group
+  useEffect(() => {
+    if (members && members.length > 0) {
+      purgeDuplicateGuestZoomLogs(members).then(res => {
+        if (res.deletedCount > 0) {
+          setSyncSuccessMsg(`🧹 Cleaned & deleted ${res.deletedCount} guest log(s) whose names belong to registered group members!`);
+          setTimeout(() => setSyncSuccessMsg(''), 5000);
+          if (onRefreshMembers) onRefreshMembers();
+        }
+      }).catch(e => console.warn('Purge duplicate guests err:', e));
+    }
+  }, [members]);
+
+  const handleManualPurgeGuestLogs = async () => {
+    setIsPurgingGuests(true);
+    try {
+      const res = await purgeDuplicateGuestZoomLogs(members);
+      if (res.deletedCount > 0) {
+        setSyncSuccessMsg(`🧹 Successfully purged ${res.deletedCount} guest log(s) whose names are in group rosters: ${res.purgedGuestNames.join(', ')}`);
+        if (onRefreshMembers) onRefreshMembers();
+      } else {
+        setSyncSuccessMsg(`✅ Guest Zoom logs are completely clean! No group members are currently logged as unregistered guests.`);
+      }
+      setTimeout(() => setSyncSuccessMsg(''), 5000);
+    } catch (err: any) {
+      console.error('Error purging guest logs:', err);
+      setSyncErrorMsg(`Error purging guest logs: ${err?.message}`);
+    } finally {
+      setIsPurgingGuests(false);
+    }
+  };
 
   // Manual Add Missing Attendee Modal
   const [showAddAttendeeModal, setShowAddAttendeeModal] = useState(false);
@@ -352,39 +439,11 @@ export default function ZoomAttendanceSync({ members, onRefreshMembers, onNaviga
       const guestRows: SyncedCorrectionRow[] = [];
 
       consolidatedMap.forEach(item => {
-        let matched: UserProfile | null = null;
-        const itemClean = cleanTitlePrefix(item.name);
-        const itemDigits = normalizeDigits(item.phone);
-
-        // 1. Match by Email
-        if (item.email) {
-          matched = members.find(m => m.email?.toLowerCase().trim() === item.email?.toLowerCase().trim()) || null;
-        }
-
-        // 2. Match by Phone Number
-        if (!matched && itemDigits.length >= 7) {
-          matched = members.find(m => {
-            const mPhone = normalizeDigits(m.phone || (m as any).whatsappNumber || m.whatsappGroup);
-            return mPhone && (mPhone.endsWith(itemDigits.slice(-7)) || itemDigits.endsWith(mPhone.slice(-7)));
-          }) || null;
-        }
-
-        // 3. Match by Exact or Cleaned Display Name
-        if (!matched && item.name) {
-          matched = members.find(m => {
-            const mName = (m.displayName || (m as any).name || '').trim();
-            if (!mName) return false;
-            const mClean = cleanTitlePrefix(mName);
-            if (mClean === itemClean) return true;
-            if (itemClean.length > 3 && mClean.length > 3) {
-              const itemWords = itemClean.split(' ').filter(w => w.length > 2);
-              const mWords = mClean.split(' ').filter(w => w.length > 2);
-              const hasCommonWords = itemWords.some(iw => mWords.includes(iw));
-              if (hasCommonWords && (itemWords.length >= 2 || mWords.length >= 2)) return true;
-            }
-            return false;
-          }) || null;
-        }
+        // Match with registered members across all prayer groups
+        const matched = findMemberForGuestLog(
+          { name: item.name, email: item.email, phone: item.phone },
+          members
+        );
 
         if (matched) {
           const uid = matched.uid || (matched as any).id;
@@ -396,7 +455,7 @@ export default function ZoomAttendanceSync({ members, onRefreshMembers, onNaviga
             });
           }
         } else {
-          // Unmatched / Guest Attendee
+          // Unmatched / Guest Attendee (only when truly not in any church group)
           guestRows.push({
             logId: `guest-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
             name: item.name,
@@ -560,19 +619,28 @@ export default function ZoomAttendanceSync({ members, onRefreshMembers, onNaviga
         });
       }
 
+      // 6. Delete any pre-existing guest zoom logs for members found in any group
+      try {
+        const qExistingGuests = query(collection(db, 'zoom_participant_logs'), where('isMember', '==', false));
+        const guestSnaps = await getDocs(qExistingGuests);
+        guestSnaps.docs.forEach(d => {
+          const gData = d.data();
+          const matchedMem = findMemberForGuestLog({ name: gData.name, email: gData.email, phone: gData.phone }, members);
+          if (matchedMem) {
+            batch.delete(doc(db, 'zoom_participant_logs', d.id));
+            batchCount++;
+          }
+        });
+      } catch (err) {
+        console.warn('Could not query existing guest logs for purge:', err);
+      }
+
       if (batchCount > 0) {
         await batch.commit();
       }
 
-      // 7. Sort: Present members first (alphabetical A-Z), then Absent members (alphabetical A-Z)
-      createdLogs.sort((a, b) => {
-        const aPresent = a.status === 'present';
-        const bPresent = b.status === 'present';
-        if (aPresent !== bPresent) {
-          return aPresent ? -1 : 1;
-        }
-        return (a.name || '').localeCompare(b.name || '', undefined, { sensitivity: 'base' });
-      });
+      // 7. Sort: Group by group (Present A-Z, Absent A-Z), lastly Unregistered attendees (A-Z)
+      const sortedLogs = sortCorrectionRowsByGroupHierarchy(createdLogs);
 
       // 8. Set Active Session and navigate to Manual Correction Station
       setSyncedSessionCorrection({
@@ -581,7 +649,7 @@ export default function ZoomAttendanceSync({ members, onRefreshMembers, onNaviga
         date: activeMeetingDate,
         totalParticipants: matchedMembersMap.size + guestRows.length,
         totalMinutes: (matchedMembersMap.size + guestRows.length) * meetingDurationMinutes,
-        rows: createdLogs
+        rows: sortedLogs
       });
 
       setActiveSubTab('correction');
@@ -793,32 +861,94 @@ export default function ZoomAttendanceSync({ members, onRefreshMembers, onNaviga
     }
   };
 
-  // 6. COPY FORMATTED ATTENDANCE SUMMARY FOR WHATSAPP
+  // 6. COPY FORMATTED ATTENDANCE SUMMARY FOR WHATSAPP (Strict Group-by-Group Hierarchy)
   const handleCopyWhatsAppSummary = () => {
     if (!syncedSessionCorrection) return;
 
-    const presentRows = syncedSessionCorrection.rows.filter(r => r.status === 'present');
-    const absentRows = syncedSessionCorrection.rows.filter(r => r.status !== 'present');
+    const allRows = syncedSessionCorrection.rows;
+    const presentRows = allRows.filter(r => r.status === 'present');
+    const absentRows = allRows.filter(r => r.status !== 'present');
+    const guestRows = allRows.filter(r => !r.isMember);
+    const registeredMembers = allRows.filter(r => r.isMember);
+
+    // Group registered members by WhatsApp community
+    const groupsMap = new Map<string, { present: SyncedCorrectionRow[]; absent: SyncedCorrectionRow[] }>();
+    registeredMembers.forEach(r => {
+      const g = r.whatsappCommunity || 'Unassigned';
+      if (!groupsMap.has(g)) groupsMap.set(g, { present: [], absent: [] });
+      if (r.status === 'present') groupsMap.get(g)!.present.push(r);
+      else groupsMap.get(g)!.absent.push(r);
+    });
+
+    const standardGroups = [...WHATSAPP_COMMUNITY_OPTIONS];
+    const groupNames = Array.from(groupsMap.keys()).sort((a, b) => {
+      const idxA = standardGroups.indexOf(a);
+      const idxB = standardGroups.indexOf(b);
+      if (idxA !== -1 && idxB !== -1) return idxA - idxB;
+      if (idxA !== -1) return -1;
+      if (idxB !== -1) return 1;
+      return a.localeCompare(b);
+    });
 
     let text = `🔥 *LIGHT UP PRAYER HOUSE — DAILY ONLINE PRAYER ATTENDANCE*\n`;
     text += `📅 *Date:* ${syncedSessionCorrection.date}\n`;
     text += `📖 *Session:* ${syncedSessionCorrection.title}\n`;
-    text += `📊 *Summary:* ${presentRows.length} Present | ${absentRows.length} Absent | Total Church Roster: ${members.length}\n\n`;
+    text += `📊 *Summary:* ${presentRows.length} Present | ${absentRows.length} Absent | Church Roster: ${registeredMembers.length}\n`;
+    if (guestRows.length > 0) {
+      text += `👤 *Unregistered Guests / Visitors:* ${guestRows.length}\n`;
+    }
+    text += `\n`;
 
-    text += `✅ *PRESENT MEMBERS (${presentRows.length}):*\n`;
-    presentRows.forEach((r, idx) => {
-      text += `${idx + 1}. ${r.name}${r.whatsappCommunity ? ` (${r.whatsappCommunity})` : ''}\n`;
+    // Group by group: Present first (A-Z), Absent next (A-Z)
+    groupNames.forEach(grpName => {
+      const entry = groupsMap.get(grpName);
+      if (!entry || (entry.present.length === 0 && entry.absent.length === 0)) return;
+      entry.present.sort((a, b) => (a.name || '').localeCompare(b.name || '', undefined, { sensitivity: 'base' }));
+      entry.absent.sort((a, b) => (a.name || '').localeCompare(b.name || '', undefined, { sensitivity: 'base' }));
+
+      text += `━━━━━━━━━━━━━━━━━━━━━\n`;
+      text += `🏛️ *${grpName.toUpperCase()}* (${entry.present.length} Present, ${entry.absent.length} Absent)\n`;
+      text += `━━━━━━━━━━━━━━━━━━━━━\n`;
+
+      text += `✅ *PRESENT (${entry.present.length})* — A to Z:\n`;
+      if (entry.present.length === 0) {
+        text += `_(No members present yet)_\n`;
+      } else {
+        entry.present.forEach((r, idx) => {
+          const phone = r.matchedMember?.phone ? ` • ${r.matchedMember.phone}` : '';
+          text += `${idx + 1}. *${r.name}*${phone}\n`;
+        });
+      }
+      text += `\n`;
+
+      text += `❌ *ABSENT (${entry.absent.length})* — A to Z:\n`;
+      if (entry.absent.length === 0) {
+        text += `_🎉 Perfect 100% Attendance for this group!_\n`;
+      } else {
+        entry.absent.forEach((r, idx) => {
+          const phone = r.matchedMember?.phone ? ` • ${r.matchedMember.phone}` : '';
+          text += `${idx + 1}. ${r.name}${phone}\n`;
+        });
+      }
+      text += `\n`;
     });
 
-    text += `\n❌ *ABSENT MEMBERS (${absentRows.length}):*\n`;
-    absentRows.forEach((r, idx) => {
-      text += `${idx + 1}. ${r.name}${r.whatsappCommunity ? ` (${r.whatsappCommunity})` : ''}\n`;
-    });
+    // Lastly: Unregistered Attendees / Visitors
+    if (guestRows.length > 0) {
+      const sortedGuests = [...guestRows].sort((a, b) => (a.name || '').localeCompare(b.name || '', undefined, { sensitivity: 'base' }));
+      text += `━━━━━━━━━━━━━━━━━━━━━\n`;
+      text += `👤 *UNREGISTERED ATTENDEES & GUESTS (${sortedGuests.length})* — A to Z:\n`;
+      text += `━━━━━━━━━━━━━━━━━━━━━\n`;
+      sortedGuests.forEach((g, idx) => {
+        text += `${idx + 1}. *${g.name}* (Visitor)\n`;
+      });
+      text += `\n`;
+    }
 
-    text += `\n🙏 _"The effectual fervent prayer of a righteous man availeth much." (James 5:16)_`;
+    text += `🙏 _"The effectual fervent prayer of a righteous man availeth much." (James 5:16)_`;
 
     navigator.clipboard.writeText(text);
-    setSyncSuccessMsg('📋 Formatted attendance summary copied to clipboard! You can paste it into your WhatsApp group.');
+    setSyncSuccessMsg('📋 Formatted attendance summary copied! Group by group: Present (A-Z), Absent (A-Z), then Unregistered attendees.');
     setTimeout(() => setSyncSuccessMsg(''), 4000);
   };
 
@@ -831,11 +961,8 @@ export default function ZoomAttendanceSync({ members, onRefreshMembers, onNaviga
     const totalRoster = syncedSessionCorrection.rows.length;
     const rate = totalRoster > 0 ? Math.round((presentRows.length / totalRoster) * 100) : 0;
 
-    // Strict alphabetical order: Present members first (A-Z), Absent members next (A-Z)
-    const sortedExportRows = [
-      ...presentRows.slice().sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' })),
-      ...absentRows.slice().sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }))
-    ];
+    // Strict group-by-group hierarchy: Group-by-group Present (A-Z) then Absent (A-Z), lastly Unregistered attendees (A-Z)
+    const sortedExportRows = sortCorrectionRowsByGroupHierarchy(syncedSessionCorrection.rows);
 
     const headers = [
       'S/N',
@@ -904,18 +1031,27 @@ export default function ZoomAttendanceSync({ members, onRefreshMembers, onNaviga
 
       sessionLogsList.forEach(log => {
         const isPres = log.status !== 'reversed_absent';
-        if (log.memberUid && isPres) presentMemberUids.add(log.memberUid);
-        const mem = members.find(m => m.uid === log.memberUid) || null;
+        let mem = members.find(m => m.uid === log.memberUid) || null;
+        if (!mem) {
+          mem = findMemberForGuestLog({ name: log.name, email: log.email, phone: (log as any).phone }, members);
+          if (mem && log.id) {
+            // Member found in a group! Automatically delete from guest/unregistered zoom log in Firestore!
+            deleteDoc(doc(db, 'zoom_participant_logs', log.id)).catch(e => console.warn('Purge guest log err:', e));
+          }
+        }
+        const isMember = Boolean(mem || log.isMember);
+        const memberUid = mem ? (mem.uid || (mem as any).id) : (log.memberUid || '');
+        if (memberUid && isPres) presentMemberUids.add(memberUid);
 
         rows.push({
           logId: log.id,
-          name: log.name,
-          email: log.email || '',
+          name: mem ? (mem.displayName || (mem as any).name || log.name) : log.name,
+          email: mem ? (mem.email || log.email || '') : (log.email || ''),
           durationMinutes: log.durationMinutes,
-          isMember: !!log.isMember,
-          memberUid: log.memberUid || '',
+          isMember,
+          memberUid,
           matchedMember: mem,
-          whatsappCommunity: log.whatsappCommunity || (mem ? getMemberWhatsAppCommunity(mem) : ''),
+          whatsappCommunity: mem ? getMemberWhatsAppCommunity(mem) : (log.whatsappCommunity || 'Unregistered Visitor'),
           date: session.meetingDate,
           status: isPres ? 'present' : 'reversed_absent',
           source: (log as any).source || 'manual'
@@ -949,10 +1085,8 @@ export default function ZoomAttendanceSync({ members, onRefreshMembers, onNaviga
       const totalRoster = rows.length;
       const rate = totalRoster > 0 ? Math.round((presentRows.length / totalRoster) * 100) : 0;
 
-      const sortedExportRows = [
-        ...presentRows.slice().sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' })),
-        ...absentRows.slice().sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }))
-      ];
+      // Strict group-by-group hierarchy: Group-by-group Present (A-Z) then Absent (A-Z), lastly Unregistered attendees (A-Z)
+      const sortedExportRows = sortCorrectionRowsByGroupHierarchy(rows);
 
       const headers = [
         'S/N',
@@ -1049,18 +1183,27 @@ export default function ZoomAttendanceSync({ members, onRefreshMembers, onNaviga
 
       sessionLogsList.forEach(log => {
         const isPres = log.status !== 'reversed_absent';
-        if (log.memberUid && isPres) presentMemberUids.add(log.memberUid);
-        const mem = members.find(m => m.uid === log.memberUid) || null;
+        let mem = members.find(m => m.uid === log.memberUid) || null;
+        if (!mem) {
+          mem = findMemberForGuestLog({ name: log.name, email: log.email, phone: (log as any).phone }, members);
+          if (mem && log.id) {
+            // Found in a group! Automatically delete from guest/unregistered zoom log in Firestore!
+            deleteDoc(doc(db, 'zoom_participant_logs', log.id)).catch(e => console.warn('Purge guest log err:', e));
+          }
+        }
+        const isMember = Boolean(mem || log.isMember);
+        const memberUid = mem ? (mem.uid || (mem as any).id) : (log.memberUid || '');
+        if (memberUid && isPres) presentMemberUids.add(memberUid);
 
         rows.push({
           logId: log.id,
-          name: log.name,
-          email: log.email || '',
+          name: mem ? (mem.displayName || (mem as any).name || log.name) : log.name,
+          email: mem ? (mem.email || log.email || '') : (log.email || ''),
           durationMinutes: log.durationMinutes,
-          isMember: log.isMember,
-          memberUid: log.memberUid || '',
+          isMember,
+          memberUid,
           matchedMember: mem,
-          whatsappCommunity: log.whatsappCommunity || (mem ? getMemberWhatsAppCommunity(mem) : ''),
+          whatsappCommunity: mem ? getMemberWhatsAppCommunity(mem) : (log.whatsappCommunity || 'Unregistered Visitor'),
           date: session.meetingDate,
           status: isPres ? 'present' : 'reversed_absent',
           source: (log as any).source || 'manual'
@@ -1089,15 +1232,8 @@ export default function ZoomAttendanceSync({ members, onRefreshMembers, onNaviga
         });
       });
 
-      // Sort: Present members first (A-Z), Absent members next (A-Z)
-      rows.sort((a, b) => {
-        const aPresent = a.status === 'present';
-        const bPresent = b.status === 'present';
-        if (aPresent !== bPresent) {
-          return aPresent ? -1 : 1;
-        }
-        return (a.name || '').localeCompare(b.name || '', undefined, { sensitivity: 'base' });
-      });
+      // Strict group-by-group hierarchy
+      const sortedRows = sortCorrectionRowsByGroupHierarchy(rows);
 
       setSyncedSessionCorrection({
         sessionId: session.id,
@@ -1105,7 +1241,7 @@ export default function ZoomAttendanceSync({ members, onRefreshMembers, onNaviga
         date: session.meetingDate,
         totalParticipants: session.totalParticipants,
         totalMinutes: session.totalMinutes,
-        rows
+        rows: sortedRows
       });
 
       setActiveSubTab('correction');
@@ -1150,39 +1286,31 @@ Guest Visitor London 45 mins`;
     setWhatsappPastedText(sample);
   };
 
-  // Filtered rows in Manual Correction Station
+  // Filtered rows in Manual Correction Station (Group-by-Group Hierarchy)
   const filteredCorrectionRows = useMemo(() => {
     if (!syncedSessionCorrection) return [];
-    return syncedSessionCorrection.rows
-      .filter(r => {
-        if (correctionStatusFilter === 'present' && r.status !== 'present') return false;
-        if (correctionStatusFilter === 'absent' && r.status === 'present') return false;
-        if (correctionStatusFilter === 'guest' && r.isMember) return false;
+    const matched = syncedSessionCorrection.rows.filter(r => {
+      if (correctionStatusFilter === 'present' && r.status !== 'present') return false;
+      if (correctionStatusFilter === 'absent' && r.status === 'present') return false;
+      if (correctionStatusFilter === 'guest' && r.isMember) return false;
 
-        if (correctionCommunityFilter !== 'all') {
-          const comm = (r.whatsappCommunity || 'Unassigned').toLowerCase().trim();
-          if (comm !== correctionCommunityFilter.toLowerCase().trim()) return false;
-        }
+      if (correctionCommunityFilter !== 'all') {
+        const comm = (r.whatsappCommunity || 'Unassigned').toLowerCase().trim();
+        if (comm !== correctionCommunityFilter.toLowerCase().trim()) return false;
+      }
 
-        if (correctionSearchFilter.trim()) {
-          const q = correctionSearchFilter.toLowerCase().trim();
-          return (
-            r.name.toLowerCase().includes(q) ||
-            r.email.toLowerCase().includes(q) ||
-            (r.whatsappCommunity && r.whatsappCommunity.toLowerCase().includes(q))
-          );
-        }
-        return true;
-      })
-      .sort((a, b) => {
-        // Present first (A-Z), then Absent (A-Z)
-        const aPresent = a.status === 'present';
-        const bPresent = b.status === 'present';
-        if (aPresent !== bPresent) {
-          return aPresent ? -1 : 1;
-        }
-        return (a.name || '').localeCompare(b.name || '', undefined, { sensitivity: 'base' });
-      });
+      if (correctionSearchFilter.trim()) {
+        const q = correctionSearchFilter.toLowerCase().trim();
+        return (
+          r.name.toLowerCase().includes(q) ||
+          r.email.toLowerCase().includes(q) ||
+          (r.whatsappCommunity && r.whatsappCommunity.toLowerCase().includes(q))
+        );
+      }
+      return true;
+    });
+
+    return sortCorrectionRowsByGroupHierarchy(matched);
   }, [syncedSessionCorrection, correctionStatusFilter, correctionCommunityFilter, correctionSearchFilter]);
 
   const presentCount = syncedSessionCorrection?.rows.filter(r => r.status === 'present').length || 0;
@@ -1548,6 +1676,17 @@ Guest Visitor London 45 mins`;
                 <div className="flex flex-wrap items-center gap-2">
                   <button
                     type="button"
+                    onClick={handleManualPurgeGuestLogs}
+                    disabled={isPurgingGuests}
+                    className="flex items-center space-x-1.5 px-4 py-2.5 bg-amber-50 hover:bg-amber-100 text-amber-900 border border-amber-200 rounded-xl text-xs font-black uppercase tracking-wider transition-all cursor-pointer shadow-xs disabled:opacity-50"
+                    title="Automatically delete any guest zoom logs matching members in any group"
+                  >
+                    {isPurgingGuests ? <RefreshCw size={14} className="animate-spin" /> : <Trash2 size={14} className="text-amber-600" />}
+                    <span>Clean Guest Logs</span>
+                  </button>
+
+                  <button
+                    type="button"
                     onClick={() => setShowAddAttendeeModal(true)}
                     className="flex items-center space-x-1.5 px-4 py-2.5 bg-emerald-50 hover:bg-emerald-100 text-emerald-800 border border-emerald-200 rounded-xl text-xs font-black uppercase tracking-wider transition-all cursor-pointer"
                   >
@@ -1737,20 +1876,44 @@ Guest Visitor London 45 mins`;
                           </td>
                         </tr>
                       ) : (
-                        filteredCorrectionRows.map((row) => {
+                        filteredCorrectionRows.map((row, idx) => {
                           const isPresent = row.status === 'present';
                           const isUpdating = updatingRowId === (row.logId || row.name);
                           const phone = row.matchedMember?.phone || (row.matchedMember as any)?.whatsappNumber || '';
                           const cleanPhone = phone.replace(/\D/g, '');
 
+                          const prevRow = idx > 0 ? filteredCorrectionRows[idx - 1] : null;
+                          const isNewGroupSection = correctionCommunityFilter === 'all' && !correctionSearchFilter.trim() && (
+                            !prevRow || 
+                            (prevRow.isMember && !row.isMember) ||
+                            ((prevRow.whatsappCommunity || 'Unassigned') !== (row.whatsappCommunity || 'Unassigned'))
+                          );
+
                           return (
-                            <tr
-                              key={row.logId || row.name}
-                              className={cn(
-                                "hover:bg-gray-50 transition-colors",
-                                !isPresent && "bg-rose-50/20"
+                            <React.Fragment key={row.logId || `${row.name}-${idx}`}>
+                              {isNewGroupSection && (
+                                <tr className="bg-gradient-to-r from-orange-50/80 via-amber-50/60 to-white text-[#1A1F3C] font-black border-y-2 border-orange-200">
+                                  <td colSpan={6} className="py-2.5 px-5 text-xs tracking-wider uppercase">
+                                    <div className="flex items-center justify-between">
+                                      <div className="flex items-center space-x-2">
+                                        <span className="w-2.5 h-2.5 rounded-full bg-[#F26522]"></span>
+                                        <span className="text-sm font-black text-[#1A1F3C]">
+                                          {!row.isMember ? '👤 UNREGISTERED ATTENDEES & GUESTS' : `🏛️ ${(row.whatsappCommunity || 'Unassigned').toUpperCase()}`}
+                                        </span>
+                                      </div>
+                                      <span className="text-[11px] font-bold text-gray-500 normal-case">
+                                        {!row.isMember ? 'Unregistered Visitors (A-Z)' : 'Present first (A-Z), then Absent (A-Z)'}
+                                      </span>
+                                    </div>
+                                  </td>
+                                </tr>
                               )}
-                            >
+                              <tr
+                                className={cn(
+                                  "hover:bg-gray-50 transition-colors",
+                                  !isPresent && "bg-rose-50/20"
+                                )}
+                              >
                               {/* Member Name */}
                               <td className="p-3.5 pl-5 font-bold text-[#1A1F3C]">
                                 <div className="flex items-center space-x-2.5">
@@ -1865,6 +2028,7 @@ Guest Visitor London 45 mins`;
                                 )}
                               </td>
                             </tr>
+                          </React.Fragment>
                           );
                         })
                       )}

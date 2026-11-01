@@ -604,8 +604,8 @@ export default function AdminDashboard() {
           snapshot.forEach((docSnap) => {
             const data = docSnap.data() as UserProfile;
             const email = (data.email || '').toLowerCase().trim();
-            // Automatically purge deprecated removed accounts
-            if (email === 'imosesstephen@gmail.com' || email === 'imosesstephen@gmail.come') {
+            // Automatically purge deprecated typo account if encountered
+            if (email === 'imosesstephen@gmail.come') {
               try {
                 deleteDoc(doc(db, 'users', docSnap.id)).catch(() => {});
               } catch (e) {
@@ -2329,15 +2329,38 @@ export default function AdminDashboard() {
       };
     });
 
-    const presentMembers = mapped.filter(r => r.isPresent);
-    const absentMembers = mapped.filter(r => !r.isPresent);
+    // Strict group-by-group hierarchy: each group shows Present members (A-Z) first, then Absent members (A-Z)
+    const groupsMap = new Map<string, { present: typeof mapped; absent: typeof mapped }>();
+    mapped.forEach(r => {
+      const g = r.community || 'Unassigned';
+      if (!groupsMap.has(g)) groupsMap.set(g, { present: [], absent: [] });
+      if (r.isPresent) groupsMap.get(g)!.present.push(r);
+      else groupsMap.get(g)!.absent.push(r);
+    });
 
-    presentMembers.sort((a, b) => a.displayName.localeCompare(b.displayName, undefined, { sensitivity: 'base' }));
-    absentMembers.sort((a, b) => a.displayName.localeCompare(b.displayName, undefined, { sensitivity: 'base' }));
+    const standardGroups = [...WHATSAPP_COMMUNITY_OPTIONS];
+    const groupNames = Array.from(groupsMap.keys()).sort((a, b) => {
+      const idxA = standardGroups.indexOf(a);
+      const idxB = standardGroups.indexOf(b);
+      if (idxA !== -1 && idxB !== -1) return idxA - idxB;
+      if (idxA !== -1) return -1;
+      if (idxB !== -1) return 1;
+      return a.localeCompare(b);
+    });
 
-    const sortedUnified = [...presentMembers, ...absentMembers];
+    const sortedUnified: typeof mapped = [];
+    groupNames.forEach(grp => {
+      const entry = groupsMap.get(grp);
+      if (!entry) return;
+      entry.present.sort((a, b) => a.displayName.localeCompare(b.displayName, undefined, { sensitivity: 'base' }));
+      entry.absent.sort((a, b) => a.displayName.localeCompare(b.displayName, undefined, { sensitivity: 'base' }));
+      sortedUnified.push(...entry.present, ...entry.absent);
+    });
+
+    const presentMembersCount = mapped.filter(r => r.isPresent).length;
+    const absentMembersCount = mapped.filter(r => !r.isPresent).length;
     const totalCount = sortedUnified.length;
-    const rate = totalCount > 0 ? Math.round((presentMembers.length / totalCount) * 100) : 0;
+    const rate = totalCount > 0 ? Math.round((presentMembersCount / totalCount) * 100) : 0;
 
     const headers = [
       'S/N',
@@ -2369,7 +2392,7 @@ export default function AdminDashboard() {
     const csvContent = '\uFEFF' + [
       `"LIGHT UP PRAYER HOUSE — MEMBERS DAILY ATTENDANCE REPORT"`,
       `"Report Date: ${todayStr}"`,
-      `"Summary: ${presentMembers.length} Present, ${absentMembers.length} Absent (${rate}% Attendance Rate)"`,
+      `"Summary: ${presentMembersCount} Present, ${absentMembersCount} Absent (${rate}% Attendance Rate)"`,
       '',
       headers.join(','),
       ...rows.map(r => r.join(','))
